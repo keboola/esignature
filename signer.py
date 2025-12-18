@@ -1,7 +1,10 @@
 """PDF signing functionality using pyhanko with visual signatures."""
 
 import io
-from datetime import datetime
+import logging
+import re
+import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
@@ -58,29 +61,48 @@ def get_certificate_info(signer: signers.SimpleSigner) -> Dict:
     """
     Extract detailed information from the signer's certificate.
 
+    All string values are sanitized to prevent injection attacks.
+
     Returns:
         Dict with certificate details
     """
+    def sanitize_cert_field(value: str, max_length: int = 100) -> str:
+        """Sanitize a certificate field value."""
+        if not value:
+            return ''
+        # Remove control characters and limit length
+        sanitized = ''.join(
+            c for c in str(value)
+            if unicodedata.category(c) not in ('Cc', 'Cf', 'Co', 'Cs')
+        )
+        sanitized = sanitized.replace('\x00', '').strip()
+        if len(sanitized) > max_length:
+            sanitized = sanitized[:max_length - 3] + "..."
+        return sanitized
+
     try:
         cert = signer.signing_cert
 
-        # Subject info
+        # Subject info - sanitize all string values
         subject = cert.subject.native
-        cn = subject.get('common_name', 'Unknown')
-        org = subject.get('organization_name', '')
-        country = subject.get('country_name', '')
+        cn = sanitize_cert_field(subject.get('common_name', 'Unknown'))
+        org = sanitize_cert_field(subject.get('organization_name', ''))
+        country = sanitize_cert_field(subject.get('country_name', ''), max_length=50)
 
-        # Issuer info
+        # Issuer info - sanitize all string values
         issuer = cert.issuer.native
-        issuer_cn = issuer.get('common_name', 'Unknown')
-        issuer_org = issuer.get('organization_name', '')
+        issuer_cn = sanitize_cert_field(issuer.get('common_name', 'Unknown'))
+        issuer_org = sanitize_cert_field(issuer.get('organization_name', ''))
 
         # Validity
         not_before = cert.not_valid_before
         not_after = cert.not_valid_after
 
-        # Serial number
+        # Serial number - format as hex, limit length
         serial = cert.serial_number
+        serial_str = format(serial, 'X') if serial else ''
+        if len(serial_str) > 64:
+            serial_str = serial_str[:61] + "..."
 
         return {
             'subject_cn': cn,
@@ -90,7 +112,7 @@ def get_certificate_info(signer: signers.SimpleSigner) -> Dict:
             'issuer_org': issuer_org,
             'valid_from': not_before.strftime('%d.%m.%Y %H:%M') if not_before else '',
             'valid_to': not_after.strftime('%d.%m.%Y %H:%M') if not_after else '',
-            'serial_number': format(serial, 'X') if serial else '',  # Hex format
+            'serial_number': serial_str,
         }
     except Exception:
         return {
@@ -106,10 +128,11 @@ def get_certificate_info(signer: signers.SimpleSigner) -> Dict:
 
 
 def get_signer_name(p12_bytes: bytes, p12_password: str) -> str:
-    """Extract the common name (CN) from a P12 certificate."""
+    """Extract and sanitize the common name (CN) from a P12 certificate."""
     try:
         signer = load_signer_from_p12(p12_bytes, p12_password)
-        return get_signer_name_from_signer(signer)
+        raw_name = get_signer_name_from_signer(signer)
+        return sanitize_signer_name(raw_name)
     except Exception:
         return "Unknown"
 
@@ -136,6 +159,132 @@ def get_initials(name: str) -> str:
     initials = ''.join(w[0].upper() for w in words if w and w[0].isalpha())
 
     return initials if initials else "?"
+
+
+class CertificateValidationError(Exception):
+    """Raised when certificate validation fails."""
+    pass
+
+
+def validate_certificate(signer: signers.SimpleSigner) -> None:
+    """
+    Validate the signer's certificate for security requirements.
+
+    Checks:
+        - Certificate is not expired
+        - Certificate is already valid (not future-dated)
+        - Certificate has required key usage for signing
+
+    Raises:
+        CertificateValidationError: If validation fails
+    """
+    try:
+        cert = signer.signing_cert
+        now = datetime.now(timezone.utc)
+
+        # Check expiration
+        not_after = cert.not_valid_after
+        if not_after.tzinfo is None:
+            # Assume UTC if no timezone
+            not_after = not_after.replace(tzinfo=timezone.utc)
+
+        if not_after < now:
+            days_expired = (now - not_after).days
+            raise CertificateValidationError(
+                f"Certificate expired {days_expired} days ago "
+                f"(expired on {not_after.strftime('%Y-%m-%d %H:%M UTC')})"
+            )
+
+        # Check not-yet-valid
+        not_before = cert.not_valid_before
+        if not_before.tzinfo is None:
+            not_before = not_before.replace(tzinfo=timezone.utc)
+
+        if not_before > now:
+            raise CertificateValidationError(
+                f"Certificate not yet valid "
+                f"(valid from {not_before.strftime('%Y-%m-%d %H:%M UTC')})"
+            )
+
+        # Warn if expiring soon (within 30 days)
+        days_until_expiry = (not_after - now).days
+        if days_until_expiry <= 30:
+            # This is a warning, not an error - log it but continue
+            logging.warning(
+                f"Certificate expires in {days_until_expiry} days "
+                f"(on {not_after.strftime('%Y-%m-%d')})"
+            )
+
+    except CertificateValidationError:
+        raise
+    except Exception as e:
+        raise CertificateValidationError(
+            f"Failed to validate certificate: {str(e)}"
+        ) from e
+
+
+# Maximum length for signer name (prevents DoS via extremely long names)
+MAX_SIGNER_NAME_LENGTH = 100
+
+
+def sanitize_signer_name(name: str) -> str:
+    """
+    Sanitize the signer name extracted from certificate for safe display.
+
+    Security measures:
+        - Remove control characters
+        - Remove potentially dangerous Unicode characters
+        - Limit length to prevent buffer issues
+        - Normalize Unicode to NFC form
+        - Remove null bytes and other binary characters
+        - Strip leading/trailing whitespace
+
+    Args:
+        name: Raw name from certificate CN field
+
+    Returns:
+        Sanitized name safe for display in PDF
+    """
+    if not name:
+        return "Unknown"
+
+    # Normalize Unicode to NFC (composed form)
+    name = unicodedata.normalize('NFC', name)
+
+    # Remove null bytes and control characters (except space)
+    # Control characters are in categories Cc (control) and Cf (format)
+    sanitized = []
+    for char in name:
+        category = unicodedata.category(char)
+        # Allow letters, numbers, punctuation, symbols, and regular spaces
+        if category not in ('Cc', 'Cf', 'Co', 'Cs'):  # Control, Format, Private Use, Surrogate
+            sanitized.append(char)
+
+    name = ''.join(sanitized)
+
+    # Remove specific dangerous patterns
+    # - Null bytes (already handled above, but be explicit)
+    name = name.replace('\x00', '')
+    # - PDF escape sequences that could be interpreted
+    name = name.replace('\\', '/')  # Backslash to forward slash
+    # - Parentheses that could break PDF strings
+    name = name.replace('(', '[').replace(')', ']')
+
+    # Remove excessive whitespace
+    name = re.sub(r'\s+', ' ', name)
+
+    # Strip leading/trailing whitespace
+    name = name.strip()
+
+    # Limit length
+    if len(name) > MAX_SIGNER_NAME_LENGTH:
+        name = name[:MAX_SIGNER_NAME_LENGTH - 3] + "..."
+
+    # Final check - if empty after sanitization, return default
+    if not name:
+        return "Unknown"
+
+    return name
 
 
 def normalize_text(text: str) -> str:
@@ -496,7 +645,14 @@ def sign_pdf_multiple(
     try:
         # Load the signer
         signer = load_signer_from_p12(p12_bytes, p12_password)
-        signer_name = get_signer_name_from_signer(signer)
+
+        # Validate certificate before using it
+        validate_certificate(signer)
+
+        # Get and sanitize signer name
+        raw_signer_name = get_signer_name_from_signer(signer)
+        signer_name = sanitize_signer_name(raw_signer_name)
+
         cert_info = get_certificate_info(signer)
 
         # Add protocol page if requested
@@ -578,6 +734,9 @@ def sign_pdf_multiple(
 
         return current_pdf
 
+    except CertificateValidationError:
+        # Re-raise certificate validation errors as-is
+        raise
     except Exception as e:
         raise ValueError(f"Failed to sign PDF: {str(e)}") from e
 

@@ -10,7 +10,12 @@ import fitz  # PyMuPDF
 import streamlit as st
 from PIL import Image, ImageDraw
 
-from signer import sign_pdf_multiple, get_signer_name, get_initials
+from signer import (
+    sign_pdf_multiple,
+    get_signer_name,
+    get_initials,
+    CertificateValidationError,
+)
 
 
 # Constants for rendering
@@ -304,8 +309,11 @@ def main():
                         st.session_state.signed_pdf = signed_pdf_bytes
                         st.success("PDF signed successfully!")
 
+                except CertificateValidationError as e:
+                    st.error(f"Certificate validation failed: {str(e)}")
+                    st.session_state.signed_pdf = None
                 except Exception as e:
-                    st.error(f"Signing error: {str(e)}")
+                    st.error("Signing failed. Please check your certificate and PDF file.")
                     st.session_state.signed_pdf = None
 
             if st.session_state.signed_pdf:
