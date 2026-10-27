@@ -17,19 +17,20 @@ Placements follow the contract documented in :mod:`geometry`.
 import io
 import logging
 import re
+import traceback
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pymupdf
 from cryptography.hazmat.primitives.serialization import pkcs12
+from pyhanko.pdf_utils import generic
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.misc import PdfError
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers
 from pyhanko.sign.fields import FieldMDPAction, FieldMDPSpec, MDPPerm
-from pyhanko.sign.general import SigningError as PyhankoSigningError
 from pyhanko.sign.signers.pdf_signer import PdfSignatureMetadata
 from pyhanko.stamp import NoOpStampStyle
 
@@ -364,6 +365,30 @@ def _format_signing_time(signed_at: datetime) -> str:
     return f"{local.strftime('%Y-%m-%d %H:%M:%S')} {local.tzname() or ''}".strip()
 
 
+def _fit_text(
+    text: str,
+    font: pymupdf.Font,
+    max_width: float,
+    fontsize: float,
+    min_fontsize: float,
+    step: float = 0.5,
+) -> Tuple[str, float]:
+    """Shrink ``text`` down to ``min_fontsize`` to fit ``max_width``; then abbreviate with "...".
+
+    Returns:
+        (text to draw, font size)
+    """
+    while fontsize > min_fontsize and font.text_length(text, fontsize=fontsize) > max_width:
+        fontsize = max(min_fontsize, fontsize - step)
+    if font.text_length(text, fontsize=fontsize) <= max_width:
+        return text, fontsize
+    ellipsis = "..."
+    shortened = text
+    while shortened and font.text_length(shortened + ellipsis, fontsize=fontsize) > max_width:
+        shortened = shortened[:-1]
+    return shortened.rstrip() + ellipsis, fontsize
+
+
 def _new_mark_page(mark_doc: pymupdf.Document, kind: str) -> pymupdf.Page:
     """Create an upright mark page of the box size with a white box and a border."""
     width, height = BOX_SIZES[kind]
@@ -390,11 +415,10 @@ def _build_signature_mark(signer_name: str, signed_at: datetime) -> pymupdf.Docu
     else:
         logger.warning("Signature font not found at %s, using Helvetica", FONT_PATH)
 
-    # Shrink long names so they stay inside the box
+    # Shrink, and if needed abbreviate, long names so they stay inside the box.
+    # The protocol page always shows the full name.
     font = pymupdf.Font(fontfile=str(FONT_PATH)) if name_font == "dancing" else pymupdf.Font("helv")
-    fontsize = 14.0
-    while fontsize > 6 and font.text_length(name, fontsize=fontsize) > BOX_SIZES[PLACEMENT_SIGNATURE][0] - 10:
-        fontsize -= 0.5
+    name, fontsize = _fit_text(name, font, BOX_SIZES[PLACEMENT_SIGNATURE][0] - 10, 14.0, 6.0)
     page.insert_text((5, 18), name, fontsize=fontsize, fontname=name_font, color=(0, 0, 0))
     page.insert_text((5, 32), _format_signing_time(signed_at), fontsize=8, fontname="helv",
                      color=(0.3, 0.3, 0.3))
@@ -410,9 +434,7 @@ def _build_initials_mark(signer_name: str) -> pymupdf.Document:
     width, height = BOX_SIZES[PLACEMENT_INITIALS]
     # Helvetica has no Czech diacritics
     text = normalize_text(get_initials(signer_name))
-    fontsize = 18
-    while fontsize > 6 and pymupdf.get_text_length(text, "helv", fontsize) > width - 6:
-        fontsize -= 1
+    text, fontsize = _fit_text(text, pymupdf.Font("helv"), width - 6, 18.0, 6.0, step=1.0)
     text_width = pymupdf.get_text_length(text, "helv", fontsize)
     page.insert_text(((width - text_width) / 2, height / 2 + fontsize * 0.35), text,
                      fontsize=fontsize, fontname="helv", color=(0, 0, 0))
@@ -456,11 +478,31 @@ PROTOCOL_MARGIN = 50
 PROTOCOL_BOTTOM = 842 - 80  # last baseline; the footer lives below
 
 
+def _split_token(word: str, fontsize: float, max_width: float) -> List[str]:
+    """Split a token wider than ``max_width`` into character chunks that fit."""
+    chunks: List[str] = []
+    current = ""
+    for char in word:
+        if current and pymupdf.get_text_length(current + char, "helv", fontsize) > max_width:
+            chunks.append(current)
+            current = char
+        else:
+            current += char
+    chunks.append(current)
+    return chunks
+
+
 def _wrap(text: str, fontsize: float, max_width: float) -> List[str]:
-    """Greedy word wrap for Helvetica text."""
+    """Greedy word wrap for Helvetica text; tokens longer than a line are split."""
     lines: List[str] = []
     current = ""
-    for word in text.split(" "):
+    words = []
+    for token in text.split(" "):
+        if pymupdf.get_text_length(token, "helv", fontsize) > max_width:
+            words.extend(_split_token(token, fontsize, max_width))
+        else:
+            words.append(token)
+    for word in words:
         candidate = f"{current} {word}" if current else word
         if current and pymupdf.get_text_length(candidate, "helv", fontsize) > max_width:
             lines.append(current)
@@ -570,8 +612,63 @@ def _append_protocol_pages(
 
 # --- Input policy and signing ----------------------------------------------------------------
 
-def _open_input_pdf(pdf_bytes: bytes) -> pymupdf.Document:
-    """Open the input PDF, rejecting unreadable, encrypted and already-signed documents."""
+# Guard against cyclic or absurdly deep AcroForm trees.
+MAX_FIELD_TREE_DEPTH = 64
+
+
+def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
+    """All fully qualified field names in the AcroForm tree plus every parent prefix.
+
+    Fields without widgets and inline field dictionaries are included, so a generated name never
+    collides with an existing field or with the parent of one (e.g. "Signature_1.child").
+    """
+    names: Set[str] = set()
+    acroform = reader.root.get("/AcroForm")
+    if acroform is None:
+        return names
+    seen: Set[Tuple[int, int]] = set()
+
+    def walk(items: Any, prefix: str, depth: int) -> None:
+        if depth > MAX_FIELD_TREE_DEPTH or not isinstance(items, generic.ArrayObject):
+            return
+        for item in items:
+            if not isinstance(item, generic.IndirectObject):
+                # Field entries must be indirect references (PDF 32000 12.7.3); pyhanko cannot
+                # safely add a field next to inline ones.
+                raise PdfInputError(
+                    "The PDF has malformed form fields and cannot be signed. "
+                    "Re-save it with another PDF tool and try again."
+                )
+            key = (item.idnum, item.generation)
+            if key in seen:
+                continue
+            seen.add(key)
+            field = item.get_object()
+            if not isinstance(field, generic.DictionaryObject):
+                continue
+            partial = field.get("/T")
+            name = prefix
+            if partial is not None:
+                name = f"{prefix}.{partial}" if prefix else str(partial)
+                names.add(name)
+            walk(field.get("/Kids"), name, depth + 1)
+
+    walk(acroform.get_object().get("/Fields"), "", 0)
+    for name in list(names):
+        parts = name.split(".")
+        names.update(".".join(parts[:i]) for i in range(1, len(parts)))
+    return names
+
+
+def _open_input_pdf(pdf_bytes: bytes) -> Tuple[pymupdf.Document, Set[str]]:
+    """Open the input PDF, rejecting unreadable, encrypted and already-signed documents.
+
+    MuPDF repairs damaged files (e.g. a wrong startxref) on open; the signature and field checks
+    run on the repaired bytes, which is also what gets signed.
+
+    Returns:
+        (open document, names already used in the AcroForm field tree)
+    """
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     except RuntimeError as e:  # pymupdf.FileDataError / EmptyFileError
@@ -584,23 +681,19 @@ def _open_input_pdf(pdf_bytes: bytes) -> pymupdf.Document:
                 "The PDF is encrypted or password-protected. Remove the protection and try again."
             )
         try:
-            reader = PdfFileReader(io.BytesIO(pdf_bytes), strict=False)
+            reader = PdfFileReader(io.BytesIO(doc.tobytes()), strict=False)
             already_signed = bool(reader.embedded_signatures)
+            taken_names = _acroform_field_names(reader)
         except PdfError as e:
             raise PdfInputError("The file is not a readable PDF.") from e
         if already_signed:
             raise PdfInputError(
                 "The PDF is already signed. Adding signatures to signed documents is not supported."
             )
-    except PdfInputError:
+    except BaseException:
         doc.close()
         raise
-    return doc
-
-
-def _existing_field_names(doc: pymupdf.Document) -> Set[str]:
-    """Names of all form fields with widgets in the document."""
-    return {widget.field_name for page in doc for widget in page.widgets() if widget.field_name}
+    return doc, taken_names
 
 
 def _signature_field_names(count: int, taken: Set[str]) -> List[str]:
@@ -628,6 +721,10 @@ def _apply_signatures(
     for index, ((page_index, box), name) in enumerate(zip(boxes, names, strict=True)):
         is_last = index == len(boxes) - 1
         writer = IncrementalPdfFileWriter(io.BytesIO(current), strict=False)
+        existing = {fq_name for fq_name, _, _ in fields.enumerate_sig_fields(writer)}
+        if name in existing:
+            # pyhanko would silently reuse the field and ignore its rectangle and lock.
+            raise SigningError("Could not create a new signature field in this PDF.")
         lock_kwargs = {}
         meta_kwargs = {}
         if lock_after_signing:
@@ -693,14 +790,14 @@ def sign_pdf_multiple(
         CertificateValidationError, PdfInputError, PlacementError, SigningError: All with
             user-safe messages that never contain the password.
     """
-    signer = load_signer_from_p12(p12_bytes, p12_password)
-    validate_certificate(signer)
-    signer_name = sanitize_signer_name(get_signer_name_from_signer(signer))
-    cert_info = get_certificate_info(signer)
-    signed_at = datetime.now(timezone.utc)
-
     try:
-        doc = _open_input_pdf(pdf_bytes)
+        signer = load_signer_from_p12(p12_bytes, p12_password)
+        validate_certificate(signer)
+        signer_name = sanitize_signer_name(get_signer_name_from_signer(signer))
+        cert_info = get_certificate_info(signer)
+        signed_at = datetime.now(timezone.utc)
+
+        doc, taken_names = _open_input_pdf(pdf_bytes)
         try:
             placements = validate_placements(doc, signatures, max_placements)
             boxes: List[Tuple[int, Optional[Tuple[float, float, float, float]]]]
@@ -708,7 +805,7 @@ def sign_pdf_multiple(
             if not boxes:
                 # Initials only: one invisible document signature.
                 boxes = [(0, None)]
-            names = _signature_field_names(len(boxes), _existing_field_names(doc))
+            names = _signature_field_names(len(boxes), taken_names)
             if add_protocol_page:
                 _append_protocol_pages(doc, placements, signer_name, cert_info, signed_at)
             # The only full save: nothing is signed yet.
@@ -720,8 +817,16 @@ def sign_pdf_multiple(
 
     except (SigningError, PlacementError):
         raise
-    except (PdfError, PyhankoSigningError, RuntimeError, ValueError, KeyError) as e:
-        logger.exception("Signing failed")
+    except Exception as e:  # noqa: BLE001 - single top-level boundary: never leak internals
+        _log_unexpected_error(e, p12_password)
         raise SigningError(
             "Signing failed because of an unexpected problem with the PDF or the certificate."
         ) from e
+
+
+def _log_unexpected_error(error: BaseException, p12_password: str) -> None:
+    """Log an unexpected error with traceback, with the P12 password masked out."""
+    details = "".join(traceback.format_exception(error))
+    if p12_password:
+        details = details.replace(p12_password, "***")
+    logger.error("Signing failed unexpectedly:\n%s", details)

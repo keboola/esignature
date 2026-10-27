@@ -8,16 +8,17 @@ import io
 
 import pymupdf
 import pytest
-from pyhanko.pdf_utils import generic
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers
 from pyhanko.sign.fields import MDPPerm
 
+import signer as signer_module
 from geometry import PlacementError
 from signer import (
     CertificateValidationError,
     PdfInputError,
+    SigningError,
     format_page_ranges,
     sign_pdf_multiple,
 )
@@ -82,19 +83,27 @@ def test_lock_keeps_file_readable_and_all_signatures_valid(identity):
     assert "/Lock" not in first.sig_field
 
 
-def test_edit_after_lock_is_detected(identity):
-    out = sign(make_pdf(), identity, [sig()], lock_after_signing=True)
-    writer = IncrementalPdfFileWriter(io.BytesIO(out))
-    content = generic.StreamObject(stream_data=b"0 0 1 rg 10 10 100 100 re f")
-    writer.add_stream_to_page(0, writer.add_object(content))
-    tampered = io.BytesIO()
-    writer.write(tampered)
+def add_later_signature(pdf_bytes, identity):
+    """Append one more approval signature (a new field) as an incremental update."""
+    writer = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
+    signer = signers.SimpleSigner.load_pkcs12_data(identity.p12, [], identity.password.encode())
+    meta = signers.PdfSignatureMetadata(field_name="Later")
+    return signers.sign_pdf(writer, meta, signer=signer).getvalue()
 
-    (signature, status), = validate_all(tampered.getvalue(), identity)
 
-    assert status.intact and status.valid
-    assert status.docmdp_ok is False
-    assert not status.bottom_line
+@pytest.mark.parametrize("lock", [False, True])
+def test_later_signature_is_allowed_only_without_lock(identity, lock):
+    out = sign(make_pdf(pages=2), identity, [sig(0), sig(1)], lock_after_signing=lock)
+
+    results = validate_all(add_later_signature(out, identity), identity)
+
+    assert len(results) == 3
+    for _, status in results:
+        assert status.intact and status.valid
+    ours = {s.field_name: status for s, status in results}
+    assert ours["Signature_1"].docmdp_ok is True
+    assert ours["Later"].docmdp_ok is True
+    assert ours["Signature_2"].docmdp_ok is (not lock)
 
 
 def test_without_lock_has_no_lock_dictionary(identity):
@@ -130,7 +139,7 @@ def test_protocol_overflows_to_more_pages_without_truncation(identity):
     placements += [initials(p) for p in (0, 1, 2)]
     out = sign(make_pdf(pages=4), identity, placements, add_protocol_page=True)
 
-    assert signature_count(out) == 40
+    assert_all_signatures_ok(out, identity, expected=40)
     doc = pymupdf.open(stream=out, filetype="pdf")
     assert doc.page_count > 5
     protocol_text = "".join(doc[p].get_text() for p in range(4, doc.page_count))
@@ -286,3 +295,112 @@ def test_long_signer_name_stays_inside_the_box():
     assert any("Maximilian" in span["text"] for span in spans)
     for span in spans:
         assert pymupdf.Rect(span["bbox"]) in DISPLAYED + (-0.5, -0.5, 0.5, 0.5), span["text"]
+
+
+def test_overlong_unbroken_name_is_abbreviated_in_mark_and_wrapped_in_protocol():
+    name = "W" * 64
+    identity = make_identity(common_name=name)
+    out = sign(make_pdf(), identity, [sig(x=DISPLAYED.x0, y=DISPLAYED.y0)], add_protocol_page=True)
+    assert_all_signatures_ok(out, identity, expected=1)
+    doc = pymupdf.open(stream=out, filetype="pdf")
+
+    mark_spans = [span for block in doc[0].get_text("dict")["blocks"]
+                  for line in block.get("lines", []) for span in line["spans"]]
+    name_spans = [span for span in mark_spans if span["text"].startswith("WWW")]
+    assert len(name_spans) == 1 and name_spans[0]["text"].endswith("...")
+    for span in mark_spans:
+        assert pymupdf.Rect(span["bbox"]) in DISPLAYED + (-0.5, -0.5, 0.5, 0.5), span["text"]
+
+    protocol = doc[1]
+    page_box = protocol.rect + (40, 0, -40, 0)
+    protocol_spans = [span for block in protocol.get_text("dict")["blocks"]
+                      for line in block.get("lines", []) for span in line["spans"]]
+    for span in protocol_spans:
+        assert pymupdf.Rect(span["bbox"]) in page_box, span["text"]
+    joined = "".join(span["text"] for span in protocol_spans).replace(" ", "")
+    assert f"Owner:{name}" in joined
+    assert f"Issuer:{name}" in joined
+
+
+# --- Existing form fields ------------------------------------------------------------------
+
+def pdf_with_acroform(fields_source):
+    """Build a 1-page PDF whose catalog /AcroForm /Fields is produced by ``fields_source(doc)``."""
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields {fields_source(doc)} >>")
+    return doc.tobytes()
+
+
+def test_widgetless_existing_signature_field_is_not_reused(identity):
+    def fields_source(doc):
+        field = doc.get_new_xref()
+        doc.update_object(field, "<< /FT /Sig /T (Signature_1) >>")
+        return f"[{field} 0 R]"
+
+    out = sign(pdf_with_acroform(fields_source), identity, [sig(x=100, y=100)], lock_after_signing=True)
+
+    (signature, _), = assert_all_signatures_ok(out, identity, expected=1)
+    assert signature.field_name == "Signature_2"
+    assert [float(v) for v in signature.sig_field["/Rect"]] == pytest.approx([100, 692, 250, 742])
+    assert signature.sig_field["/Lock"]["/P"] == 1
+    assert signature.docmdp_level == MDPPerm.NO_CHANGES
+
+
+def test_inline_field_dictionary_is_rejected_clearly(identity):
+    """PDF requires indirect field references; pyhanko cannot extend such a form safely."""
+    pdf = pdf_with_acroform(lambda doc: "[<< /FT /Sig /T (Signature_1) >>]")
+
+    with pytest.raises(PdfInputError, match="form fields"):
+        sign(pdf, identity, [sig(x=100, y=100)], lock_after_signing=True)
+
+
+def test_parent_name_of_existing_field_is_not_reused(identity):
+    def fields_source(doc):
+        parent, child = doc.get_new_xref(), doc.get_new_xref()
+        doc.update_object(parent, f"<< /T (Signature_1) /Kids [{child} 0 R] >>")
+        doc.update_object(child, f"<< /T (child) /FT /Sig /Parent {parent} 0 R >>")
+        return f"[{parent} 0 R]"
+
+    out = sign(pdf_with_acroform(fields_source), identity, [sig()])
+
+    (signature, _), = assert_all_signatures_ok(out, identity, expected=1)
+    assert signature.field_name == "Signature_2"
+
+
+# --- Repairable and re-saved inputs --------------------------------------------------------
+
+def test_pdf_with_broken_xref_that_mupdf_repairs_is_signed(identity):
+    good = make_pdf(text="hello")
+    broken = good[:good.rfind(b"startxref")] + b"startxref\n12345\n%%EOF\n"
+
+    out = sign(broken, identity, [sig()])
+
+    assert_all_signatures_ok(out, identity, expected=1)
+
+
+def test_signed_then_resaved_pdf_is_rejected(identity):
+    writer = IncrementalPdfFileWriter(io.BytesIO(make_pdf()))
+    signer = signers.SimpleSigner.load_pkcs12_data(identity.p12, [], identity.password.encode())
+    signed = signers.sign_pdf(writer, signers.PdfSignatureMetadata(field_name="X"), signer=signer)
+    resaved = pymupdf.open(stream=signed.getvalue(), filetype="pdf").tobytes(garbage=3)
+
+    with pytest.raises(PdfInputError, match="already signed"):
+        sign(resaved, identity, [sig()])
+
+
+# --- Unexpected library errors become a safe SigningError ----------------------------------
+
+def test_unexpected_library_error_becomes_safe_signing_error(identity, monkeypatch, caplog):
+    def explode(*args, **kwargs):
+        raise IndexError(f"internal detail {identity.password}")
+
+    monkeypatch.setattr(signer_module, "PdfFileReader", explode)
+
+    with pytest.raises(SigningError) as excinfo:
+        sign(make_pdf(), identity, [sig()])
+
+    assert type(excinfo.value) in (SigningError, PdfInputError)
+    assert identity.password not in str(excinfo.value)
+    assert identity.password not in caplog.text
+    assert "IndexError" in caplog.text

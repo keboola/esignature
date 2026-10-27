@@ -3,7 +3,8 @@ Streamlit application for signing PDF documents.
 Supports multiple signatures on different pages, initials, and protocol.
 """
 
-from typing import Dict, List, Tuple
+import logging
+from typing import Dict, List, Optional, Tuple
 
 import pymupdf as fitz  # PyMuPDF
 import streamlit as st
@@ -35,6 +36,9 @@ SIGNATURE_COLORS = {
 
 # Margins for initials
 INITIALS_MARGIN = 20  # Margin from page edge in PDF points
+INITIALS_OFFSET_MAX = 50  # Largest offset away from the corner in PDF points
+
+logger = logging.getLogger(__name__)
 
 
 def pdf_page_to_image(
@@ -177,6 +181,85 @@ def to_signer_placement(
     }
 
 
+def initials_offset_limits(corner: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Slider ranges (x, y) for the initials offset that keep the box on the page.
+
+    With the 20 pt margin, any offset in these ranges keeps the initials box inside every page
+    at least 120 x 105 pt; smaller pages are reported by the signer when signing.
+    """
+    if corner == "left":
+        x_range = (-INITIALS_MARGIN, INITIALS_OFFSET_MAX)
+    else:
+        x_range = (-INITIALS_OFFSET_MAX, INITIALS_MARGIN)
+    return x_range, (-INITIALS_MARGIN, INITIALS_OFFSET_MAX)
+
+
+def build_placements(
+    signatures: List[Dict],
+    initials_pages: List[int],
+    page_sizes: List[Tuple[float, float]],
+    corner: str,
+    offset_x: int,
+    offset_y: int,
+) -> List[Dict]:
+    """Build signer placements from UI state, dropping pages that the current PDF does not have."""
+    page_count = len(page_sizes)
+    placements = []
+    for sig in signatures:
+        if 0 <= sig["page"] < page_count:
+            page_height = page_sizes[sig["page"]][1]
+            placement = to_signer_placement(sig.get("type", "full"), sig["x"], sig["y"], page_height)
+            placements.append({"page": sig["page"], **placement})
+    for page in initials_pages:
+        if 0 <= page < page_count:
+            page_width, page_height = page_sizes[page]
+            init_x, init_y = get_initials_position(corner, page_width, page_height, offset_x, offset_y)
+            placements.append({"page": page, **to_signer_placement("initials", init_x, init_y, page_height)})
+    return placements
+
+
+def sign_from_ui(
+    pdf_bytes: bytes,
+    p12_bytes: bytes,
+    password: str,
+    signatures: List[Dict],
+    initials_pages: List[int],
+    corner: str,
+    offset_x: int,
+    offset_y: int,
+    lock: bool,
+    protocol: bool,
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """Sign from UI state. This is the UI's error boundary: it never raises.
+
+    Returns:
+        (signed PDF, None) on success, or (None, user-safe error message).
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_sizes = [(p.rect.width, p.rect.height) for p in doc]
+        doc.close()
+        placements = build_placements(signatures, initials_pages, page_sizes, corner, offset_x, offset_y)
+        if not placements:
+            return None, "No signatures or initials on pages of this PDF. Add them again."
+        signed = sign_pdf_multiple(
+            pdf_bytes=pdf_bytes,
+            p12_bytes=p12_bytes,
+            p12_password=password,
+            signatures=placements,
+            lock_after_signing=lock,
+            add_protocol_page=protocol,
+        )
+        return signed, None
+    except CertificateValidationError as e:
+        return None, f"Certificate validation failed: {e}"
+    except (SigningError, PlacementError) as e:
+        return None, f"Signing failed: {e}"
+    except Exception as e:  # noqa: BLE001 - UI error boundary; details are not shown or logged
+        logger.error("Unexpected error while signing (%s)", type(e).__name__)
+        return None, "Signing failed because of an unexpected error. Please check the PDF and certificate."
+
+
 def main():
     st.set_page_config(
         page_title="Keboola eSignature",
@@ -254,8 +337,7 @@ def main():
             lock_pdf = st.checkbox(
                 "Lock PDF after signing",
                 value=False,
-                help="Requests no further changes; enforcement depends on the PDF viewer. "
-                     "Any later change will show the signatures as broken."
+                help="Requests no further changes; enforcement depends on the PDF viewer."
             )
 
             add_protocol = st.checkbox(
@@ -288,52 +370,24 @@ def main():
             can_sign = pdf_file and p12_file and has_signatures
 
             if st.button("Sign PDF", type="primary", use_container_width=True, disabled=not can_sign):
-                try:
-                    with st.spinner("Signing document..."):
-                        pdf_bytes = pdf_file.getvalue()
-                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                        page_sizes = [(p.rect.width, p.rect.height) for p in doc]
-                        doc.close()
-                        all_signatures = []
-
-                        # Add regular signatures
-                        for sig in st.session_state.signatures:
-                            placement = to_signer_placement(
-                                sig.get("type", "full"), sig["x"], sig["y"], page_sizes[sig["page"]][1],
-                            )
-                            all_signatures.append({"page": sig["page"], **placement})
-
-                        # Add initials
-                        for page in st.session_state.initials_pages:
-                            pw, ph = page_sizes[page]
-                            init_x, init_y = get_initials_position(
-                                st.session_state.initials_corner,
-                                pw, ph,
-                                st.session_state.initials_offset_x,
-                                st.session_state.initials_offset_y,
-                            )
-                            placement = to_signer_placement("initials", init_x, init_y, ph)
-                            all_signatures.append({"page": page, **placement})
-
-                        # Sign
-                        signed_pdf_bytes = sign_pdf_multiple(
-                            pdf_bytes=pdf_bytes,
-                            p12_bytes=p12_file.getvalue(),
-                            p12_password=password,
-                            signatures=all_signatures,
-                            lock_after_signing=lock_pdf,
-                            add_protocol_page=add_protocol,
-                        )
-
-                        st.session_state.signed_pdf = signed_pdf_bytes
-                        st.success("PDF signed successfully!")
-
-                except CertificateValidationError as e:
-                    st.error(f"Certificate validation failed: {e}")
-                    st.session_state.signed_pdf = None
-                except (SigningError, PlacementError) as e:
-                    st.error(f"Signing failed: {e}")
-                    st.session_state.signed_pdf = None
+                with st.spinner("Signing document..."):
+                    signed_pdf_bytes, error = sign_from_ui(
+                        pdf_bytes=pdf_file.getvalue(),
+                        p12_bytes=p12_file.getvalue(),
+                        password=password,
+                        signatures=st.session_state.signatures,
+                        initials_pages=st.session_state.initials_pages,
+                        corner=st.session_state.initials_corner,
+                        offset_x=st.session_state.initials_offset_x,
+                        offset_y=st.session_state.initials_offset_y,
+                        lock=lock_pdf,
+                        protocol=add_protocol,
+                    )
+                st.session_state.signed_pdf = signed_pdf_bytes
+                if error:
+                    st.error(error)
+                else:
+                    st.success("PDF signed successfully!")
 
             if st.session_state.signed_pdf:
                 original_name = pdf_file.name
@@ -359,6 +413,16 @@ def main():
 
     pdf_bytes = pdf_file.getvalue()
     page_count = get_pdf_page_count(pdf_bytes)
+
+    # A replaced PDF may have fewer pages: drop placements on pages that no longer exist
+    st.session_state.signatures = [s for s in st.session_state.signatures if s["page"] < page_count]
+    st.session_state.initials_pages = [p for p in st.session_state.initials_pages if p < page_count]
+    if "initials_multiselect" in st.session_state:
+        st.session_state.initials_multiselect = [
+            p for p in st.session_state.initials_multiselect if p < page_count
+        ]
+    if st.session_state.selected_signature >= len(st.session_state.signatures):
+        st.session_state.selected_signature = -1
 
     # Tabs for signature types
     tab_signature, tab_initials = st.tabs(["Signatures", "Initials"])
@@ -510,14 +574,24 @@ def main():
             st.session_state.initials_corner = corner
 
         with col_offset:
+            # Clamp stored offsets into the ranges for the chosen corner so the box stays on the page
+            (x_min, x_max), (y_min, y_max) = initials_offset_limits(corner)
+            for key, low, high in (
+                ("initials_offset_x", x_min, x_max),
+                ("init_offset_x_slider", x_min, x_max),
+                ("initials_offset_y", y_min, y_max),
+                ("init_offset_y_slider", y_min, y_max),
+            ):
+                if key in st.session_state:
+                    st.session_state[key] = min(max(st.session_state[key], low), high)
             offset_x = st.slider(
                 "Offset X",
-                -50, 50, st.session_state.initials_offset_x,
+                x_min, x_max, st.session_state.initials_offset_x,
                 key="init_offset_x_slider"
             )
             offset_y = st.slider(
                 "Offset Y",
-                -50, 50, st.session_state.initials_offset_y,
+                y_min, y_max, st.session_state.initials_offset_y,
                 key="init_offset_y_slider"
             )
 

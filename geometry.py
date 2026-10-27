@@ -15,7 +15,7 @@ derived from its result, so they cannot diverge.
 import contextlib
 import math
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Sequence, Tuple
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 import pymupdf
 
@@ -122,8 +122,18 @@ def convert_displayed_rect(page: pymupdf.Page, displayed_rect: pymupdf.Rect) -> 
     )
 
 
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def _finite_float(value: Any) -> Optional[float]:
+    """Return ``value`` as a finite float, or None if it is not an int/float or not finite.
+
+    bool is rejected; integers too large for a float (e.g. 10**400) count as not finite.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def validate_placements(
@@ -161,11 +171,11 @@ def validate_placements(
             )
 
         kind = raw.get("type")
-        if kind not in BOX_SIZES:
+        if not isinstance(kind, str) or kind not in BOX_SIZES:
             raise PlacementError(f"{label}: type must be 'signature' or 'initials'.")
 
-        x, y = raw.get("x"), raw.get("y")
-        if not (_is_number(x) and _is_number(y) and math.isfinite(x) and math.isfinite(y)):
+        x, y = _finite_float(raw.get("x")), _finite_float(raw.get("y"))
+        if x is None or y is None:
             raise PlacementError(f"{label}: position must be finite numbers.")
 
         page = doc[page_index]
@@ -176,7 +186,7 @@ def validate_placements(
                 "which is not supported."
             )
 
-        placement = Placement(page=page_index, type=kind, x=float(x), y=float(y))
+        placement = Placement(page=page_index, type=kind, x=x, y=y)
         box = placement.displayed_rect
         bounds = page.rect
         if (
