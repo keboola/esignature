@@ -126,3 +126,31 @@ def test_validate_rejects_empty_and_too_many():
         validate_placements(doc, [placement()] * 3, max_placements=2)
     with pytest.raises(PlacementError, match="must be a list"):
         validate_placements(doc, {"page": 0})
+
+
+def _pdf_with_rotate(value: str, on_parent: bool = False) -> bytes:
+    doc = pymupdf.open()
+    page = doc.new_page(width=600, height=800)
+    if on_parent:
+        parent = int(doc.xref_get_key(page.xref, "Parent")[1].split()[0])
+        doc.xref_set_key(parent, "Rotate", value)
+        doc.xref_set_key(page.xref, "Rotate", "null")  # inherit from /Pages
+    else:
+        doc.xref_set_key(page.xref, "Rotate", value)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+@pytest.mark.parametrize("value, on_parent", [("45", False), ("100", False), ("45", True), ("90.5", False)])
+def test_validate_rejects_rotation_that_is_not_a_multiple_of_90(value, on_parent):
+    # PDF.js and PyMuPDF disagree on how such pages are displayed, so the drop point is ambiguous.
+    with pymupdf.open(stream=_pdf_with_rotate(value, on_parent), filetype="pdf") as doc:
+        with pytest.raises(PlacementError, match="rotation"):
+            validate_placements(doc, [{"page": 0, "type": "signature", "x": 10, "y": 10}])
+
+
+@pytest.mark.parametrize("value", ["-90", "450", "270"])
+def test_validate_accepts_rotation_multiples_of_90(value):
+    with pymupdf.open(stream=_pdf_with_rotate(value), filetype="pdf") as doc:
+        assert validate_placements(doc, [{"page": 0, "type": "signature", "x": 10, "y": 10}])

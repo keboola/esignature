@@ -39,3 +39,15 @@ def test_non_loopback_host_is_rejected(host):
 def test_invalid_values_name_the_variable(name, value):
     with pytest.raises(ConfigError, match=name):
         load_settings({name: value})
+
+
+def test_default_http_port_is_omitted_from_allowed_origins():
+    # Browsers serialise http://127.0.0.1:80 as http://127.0.0.1.
+    assert load_settings({"ESIGN_PORT": "80"}).allowed_origins == {"http://127.0.0.1", "http://localhost"}
+
+
+def test_body_timeout_setting():
+    assert load_settings({}).body_timeout_s == 30
+    assert load_settings({"ESIGN_BODY_TIMEOUT_S": "5"}).body_timeout_s == 5
+    with pytest.raises(ConfigError, match="ESIGN_BODY_TIMEOUT_S"):
+        load_settings({"ESIGN_BODY_TIMEOUT_S": "0"})

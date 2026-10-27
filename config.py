@@ -28,6 +28,8 @@ class Settings:
     max_placements: int = 1000
     # Requests admitted at once (being uploaded, parsed, queued or signed); more get 503.
     max_in_flight: int = 2
+    # Seconds a client may take to send a whole request body; slower uploads get 408.
+    body_timeout_s: float = 30
 
     @property
     def max_request_bytes(self) -> int:
@@ -41,7 +43,9 @@ class Settings:
 
     @property
     def allowed_origins(self) -> frozenset:
-        return frozenset(f"http://{host}:{self.port}" for host in LOOPBACK_HOSTS)
+        # Browsers omit the default port when they serialise an Origin.
+        port = "" if self.port == 80 else f":{self.port}"
+        return frozenset(f"http://{host}{port}" for host in LOOPBACK_HOSTS)
 
 
 def _int(env: Mapping[str, str], name: str, default: int, minimum: int, maximum: int) -> int:
@@ -79,4 +83,5 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         max_p12_bytes=_int(env, "ESIGN_MAX_P12_KB", 256, 1, 10 * 1024) * 1024,
         max_placements=_int(env, "ESIGN_MAX_PLACEMENTS", defaults.max_placements, 1, 10000),
         max_in_flight=_int(env, "ESIGN_MAX_IN_FLIGHT", defaults.max_in_flight, 1, 16),
+        body_timeout_s=_int(env, "ESIGN_BODY_TIMEOUT_S", int(defaults.body_timeout_s), 1, 3600),
     )

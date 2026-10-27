@@ -513,3 +513,51 @@ def test_r30_control_default_starlette_parser_would_spool_to_disk(monkeypatch):
     form = asyncio.run(server.InMemoryMultiPartParser(
         headers, stream(), spool_max_size=len(body) + 1).parse())
     assert form["pdf"].size == MultiPartParser.spool_max_size + 1
+
+
+def test_port_80_page_origin_is_accepted(identity):
+    with TestClient(make_app(replace(SETTINGS, port=80)), base_url="http://127.0.0.1") as http:
+        response = http.post("/api/sign", headers=auth(http, origin="http://127.0.0.1"),
+                             **sign_form(identity))
+    assert response.status_code == 200
+
+
+def test_deeply_nested_placements_json_is_400_not_500(identity):
+    # json raises RecursionError somewhere past ~100k levels depending on the Python build; a
+    # larger ESIGN_MAX_PLACEMENTS raises the field cap enough to get there.
+    settings = Settings(max_placements=10_000)
+    depth = 600_000
+    assert 2 * depth <= settings.max_field_bytes
+    with TestClient(make_app(settings), base_url=BASE) as http:
+        response = http.post("/api/sign", headers=auth(http),
+                             **sign_form(identity, placements="[" * depth + "]" * depth))
+        assert http.app.state.gate.in_flight == 0
+    assert response.status_code == 400
+    assert response.json()["error"] == "Placements are not valid JSON."
+
+
+def test_stalled_upload_times_out_with_408_and_frees_the_slot(identity):
+    app = make_app(replace(SETTINGS, max_in_flight=1, body_timeout_s=0.3))
+
+    async def stalled():
+        yield (b'--x\r\nContent-Disposition: form-data; name="pdf"; filename="a.pdf"\r\n'
+               b"Content-Type: application/pdf\r\n\r\n%PDF-1.7")
+        await asyncio.sleep(30)  # the client stops sending
+
+    async def scenario():
+        async with _async_client(app) as http:
+            headers = {"Origin": ORIGIN, "X-ESign-Token": await _token(http)}
+            started = time.monotonic()
+            stuck = await http.post("/api/sign", content=stalled(), headers={
+                **headers, "Content-Type": "multipart/form-data; boundary=x"})
+            elapsed = time.monotonic() - started
+            after = await http.post("/api/certificate", headers=headers,
+                                    files={"p12": ("c.p12", identity.p12)},
+                                    data={"password": identity.password})
+            return stuck, elapsed, after
+
+    stuck, elapsed, after = asyncio.run(scenario())
+    assert stuck.status_code == 408
+    assert elapsed < 5
+    assert after.status_code == 200
+    assert app.state.gate.in_flight == 0

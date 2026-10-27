@@ -88,6 +88,28 @@ def _page_user_unit(page: pymupdf.Page) -> float:
         return float("nan")
 
 
+def _raw_page_rotation(page: pymupdf.Page) -> Optional[float]:
+    """The page's /Rotate as written (inherited from /Pages parents), or None if it is not a number.
+
+    PyMuPDF normalises invalid values, PDF.js handles them differently, so callers must not rely on
+    ``page.rotation`` alone to know how a viewer displays the page.
+    """
+    doc = page.parent
+    xref = page.xref
+    for _ in range(64):  # bounded walk up the page tree
+        kind, value = doc.xref_get_key(xref, "Rotate")
+        if kind not in ("null", "undefined"):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        kind, value = doc.xref_get_key(xref, "Parent")
+        if kind != "xref":
+            break
+        xref = int(value.split()[0])
+    return 0.0
+
+
 @contextlib.contextmanager
 def unrotated_page(page: pymupdf.Page) -> Iterator[int]:
     """Temporarily set the page rotation to 0 and yield the original rotation.
@@ -184,6 +206,13 @@ def validate_placements(
             raise PlacementError(
                 f"{label}: page {page_index + 1} uses a non-standard unit size (/UserUnit), "
                 "which is not supported."
+            )
+
+        rotate = _raw_page_rotation(page)
+        if rotate is None or not math.isfinite(rotate) or rotate % 90 != 0:
+            raise PlacementError(
+                f"{label}: page {page_index + 1} has an invalid rotation (/Rotate is not a multiple "
+                "of 90 degrees), so its layout is ambiguous. Fix the page rotation and try again."
             )
 
         placement = Placement(page=page_index, type=kind, x=x, y=y)

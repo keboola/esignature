@@ -262,7 +262,10 @@ async def read_form(
         spool_max_size=settings.max_request_bytes + 1,
     )
     try:
-        form = await parser.parse()
+        # A client that stops sending must not hold an admission slot forever.
+        form = await asyncio.wait_for(parser.parse(), timeout=settings.body_timeout_s)
+    except TimeoutError:
+        raise ApiError(408, "The upload took too long. Try again.") from None
     except MultiPartException:
         raise ApiError(400, "The upload could not be read.") from None
     except BodyTooLarge:
@@ -308,7 +311,7 @@ def parse_placements(raw: str) -> Any:
 
     try:
         return json.loads(raw, parse_constant=reject_constant)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
         raise ApiError(400, "Placements are not valid JSON.") from None
 
 
