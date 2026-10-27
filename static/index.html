@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Per-launch API token, replaced by the server when it serves this page. -->
+  <meta name="esign-token" content="__ESIGN_TOKEN__">
+  <title>Keboola eSignature</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- Uses PDF.js 5.7.284, vendored under /static/vendor/pdfjs (see static/js/viewer.js). -->
+  <script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>eSignature</div>
+    <div class="doc-title" id="doc-title">No document open</div>
+    <div class="zoom" role="group" aria-label="Zoom">
+      <button type="button" class="icon-button" id="zoom-out" aria-label="Zoom out" disabled>&minus;</button>
+      <button type="button" class="zoom-label" id="zoom-label" title="Fit to width" disabled>100%</button>
+      <button type="button" class="icon-button" id="zoom-in" aria-label="Zoom in" disabled>+</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="viewer" id="viewer" aria-label="Document pages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-card">
+          <div class="empty-icon" aria-hidden="true"></div>
+          <p class="empty-title">Drop a PDF here</p>
+          <p class="muted">or <button type="button" class="link-button" id="empty-choose">choose a file</button></p>
+          <p class="muted small">The document stays in your browser until you sign it.</p>
+        </div>
+      </div>
+      <div class="place-banner" id="place-banner" hidden>
+        <span id="place-banner-text">Click on a page to place your signature</span>
+        <button type="button" class="link-button" id="place-cancel">Cancel (Esc)</button>
+      </div>
+      <div class="pages" id="pages"></div>
+    </section>
+
+    <aside class="panel" aria-label="Signing steps">
+      <ol class="steps">
+        <li class="step" id="step-document">
+          <h2><span class="step-num">1</span>Document</h2>
+          <label class="file-field">
+            <input type="file" id="pdf-input" accept="application/pdf,.pdf">
+            <span class="file-button">Choose PDF</span>
+            <span class="file-name" id="pdf-name">No file chosen</span>
+          </label>
+          <p class="muted small" id="doc-info"></p>
+        </li>
+
+        <li class="step" id="step-certificate">
+          <h2><span class="step-num">2</span>Certificate</h2>
+          <label class="file-field">
+            <input type="file" id="p12-input" accept=".p12,.pfx,application/x-pkcs12">
+            <span class="file-button">Choose P12 / PFX</span>
+            <span class="file-name" id="p12-name">No file chosen</span>
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input type="password" id="password" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="cert-status" id="cert-status" aria-live="polite" hidden>
+            <div class="cert-name" id="cert-name"></div>
+            <div class="muted small" id="cert-details"></div>
+          </div>
+        </li>
+
+        <li class="step" id="step-place">
+          <h2><span class="step-num">3</span>Place</h2>
+          <button type="button" class="button secondary block" id="add-signature" disabled>+ Add signature</button>
+          <p class="muted small">Click on a page to place. Drag to move. Arrow keys nudge by 1&nbsp;pt (Shift: 10&nbsp;pt), Delete removes.</p>
+          <ul class="placement-list" id="signature-list"></ul>
+
+          <div class="initials-block">
+            <label class="check">
+              <input type="checkbox" id="initials-on" disabled>
+              <span>Initials on pages</span>
+            </label>
+            <div class="initials-options" id="initials-options" hidden>
+              <label class="field">
+                <span>Pages</span>
+                <select id="initials-pages">
+                  <option value="all">All pages</option>
+                  <option value="all-but-last">All except the last page</option>
+                  <option value="custom">Custom pages</option>
+                </select>
+              </label>
+              <label class="field" id="initials-custom-field" hidden>
+                <span>Page numbers</span>
+                <input type="text" id="initials-custom" placeholder="e.g. 1-3, 5" spellcheck="false">
+              </label>
+              <label class="field">
+                <span>Corner</span>
+                <select id="initials-corner">
+                  <option value="br">Bottom right</option>
+                  <option value="bl">Bottom left</option>
+                </select>
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>From side (pt)</span>
+                  <input type="number" id="initials-mx" value="20" step="1">
+                </label>
+                <label class="field">
+                  <span>From bottom (pt)</span>
+                  <input type="number" id="initials-my" value="20" step="1">
+                </label>
+              </div>
+              <p class="muted small">One shared mark: dragging it on any page moves it on all selected pages.</p>
+              <p class="warning small" id="initials-warning" hidden></p>
+            </div>
+          </div>
+        </li>
+
+        <li class="step" id="step-options">
+          <h2><span class="step-num">4</span>Options</h2>
+          <label class="check">
+            <input type="checkbox" id="opt-protocol">
+            <span>Add protocol page<small class="muted block">A summary page with certificate and signature details.</small></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="opt-lock">
+            <span>Lock PDF after signing<small class="muted block">Requests no further changes; enforcement depends on the PDF viewer.</small></span>
+          </label>
+        </li>
+
+        <li class="step" id="step-sign">
+          <h2><span class="step-num">5</span>Sign</h2>
+          <button type="button" class="button primary block" id="sign" disabled>Sign document</button>
+          <p class="muted small" id="sign-hint"></p>
+          <p class="error small" id="sign-error" role="alert" hidden></p>
+          <a class="button success block" id="download" hidden>Download signed PDF</a>
+        </li>
+      </ol>
+    </aside>
+  </main>
+</body>
+</html>

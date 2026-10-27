@@ -151,3 +151,9 @@ def ink_bbox(page: pymupdf.Page, zoom: int = 4) -> Tuple[float, float, float, fl
             xs.append(dark[-1])
     assert xs, "nothing drawn on the page"
     return min(xs) / zoom, min(ys) / zoom, (max(xs) + 1) / zoom, (max(ys) + 1) / zoom
+
+
+def pytest_collection_modifyitems(items):
+    """Run browser tests last: Playwright's sync API keeps an event loop running on the main
+    thread for the rest of the session, which breaks pyHanko's asyncio.run in later tests."""
+    items.sort(key=lambda item: "tests/e2e/" in item.nodeid)
