@@ -3,20 +3,20 @@ Streamlit application for signing PDF documents.
 Supports multiple signatures on different pages, initials, and protocol.
 """
 
-import io
-from typing import Tuple, List, Dict
+from typing import Dict, List, Tuple
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 import streamlit as st
 from PIL import Image, ImageDraw
 
 from signer import (
-    sign_pdf_multiple,
-    get_signer_name,
-    get_initials,
     CertificateValidationError,
+    PlacementError,
+    SigningError,
+    get_initials,
+    get_signer_name,
+    sign_pdf_multiple,
 )
-
 
 # Constants for rendering
 PREVIEW_DPI = 120
@@ -152,6 +152,31 @@ def get_initials_position(
     return x, y
 
 
+def to_signer_placement(
+    sig_type: str,
+    x: float,
+    y_from_bottom: float,
+    page_height_pts: float,
+) -> Dict:
+    """Convert this UI's bottom-left slider position to the signer's placement contract.
+
+    The sliders give the box's bottom-left corner measured from the bottom-left of the displayed
+    page; the signer expects the TOP-LEFT corner measured from the top-left of the displayed page
+    (see geometry.py).
+    """
+    if sig_type == "initials":
+        box_height = INITIALS_HEIGHT
+        placement_type = "initials"
+    else:
+        box_height = SIGNATURE_HEIGHT
+        placement_type = "signature"
+    return {
+        "type": placement_type,
+        "x": float(x),
+        "y": float(page_height_pts - y_from_bottom - box_height),
+    }
+
+
 def main():
     st.set_page_config(
         page_title="Keboola eSignature",
@@ -209,15 +234,15 @@ def main():
         )
 
         # Certificate info
-        if p12_file and password:
+        if p12_file:
             try:
                 signer_name = get_signer_name(p12_file.getvalue(), password)
                 st.session_state.signer_name = signer_name
                 initials = get_initials(signer_name)
                 st.success(f"Certificate: **{signer_name}**")
                 st.info(f"Initials: **{initials}**")
-            except Exception as e:
-                st.error(f"Certificate error: {str(e)}")
+            except CertificateValidationError as e:
+                st.error(f"Certificate error: {e}")
                 st.session_state.signer_name = None
 
         st.markdown("---")
@@ -229,7 +254,8 @@ def main():
             lock_pdf = st.checkbox(
                 "Lock PDF after signing",
                 value=False,
-                help="Prevent modifications after signing"
+                help="Requests no further changes; enforcement depends on the PDF viewer. "
+                     "Any later change will show the signatures as broken."
             )
 
             add_protocol = st.checkbox(
@@ -258,47 +284,40 @@ def main():
 
             # Sign button
             has_signatures = sig_count > 0 or init_count > 0
-            can_sign = pdf_file and p12_file and password and has_signatures
+            # An empty certificate password is valid
+            can_sign = pdf_file and p12_file and has_signatures
 
             if st.button("Sign PDF", type="primary", use_container_width=True, disabled=not can_sign):
                 try:
                     with st.spinner("Signing document..."):
                         pdf_bytes = pdf_file.getvalue()
+                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        page_sizes = [(p.rect.width, p.rect.height) for p in doc]
+                        doc.close()
                         all_signatures = []
 
                         # Add regular signatures
                         for sig in st.session_state.signatures:
-                            all_signatures.append({
-                                "page": sig["page"],
-                                "x": sig["x"],
-                                "y": sig["y"],
-                                "type": sig.get("type", "full"),
-                            })
+                            placement = to_signer_placement(
+                                sig.get("type", "full"), sig["x"], sig["y"], page_sizes[sig["page"]][1],
+                            )
+                            all_signatures.append({"page": sig["page"], **placement})
 
                         # Add initials
                         for page in st.session_state.initials_pages:
-                            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                            p = doc[page]
-                            pw, ph = p.rect.width, p.rect.height
-                            doc.close()
-
+                            pw, ph = page_sizes[page]
                             init_x, init_y = get_initials_position(
                                 st.session_state.initials_corner,
                                 pw, ph,
                                 st.session_state.initials_offset_x,
                                 st.session_state.initials_offset_y,
                             )
-
-                            all_signatures.append({
-                                "page": page,
-                                "x": init_x,
-                                "y": init_y,
-                                "type": "initials",
-                            })
+                            placement = to_signer_placement("initials", init_x, init_y, ph)
+                            all_signatures.append({"page": page, **placement})
 
                         # Sign
                         signed_pdf_bytes = sign_pdf_multiple(
-                            pdf_bytes=pdf_file.getvalue(),
+                            pdf_bytes=pdf_bytes,
                             p12_bytes=p12_file.getvalue(),
                             p12_password=password,
                             signatures=all_signatures,
@@ -310,10 +329,10 @@ def main():
                         st.success("PDF signed successfully!")
 
                 except CertificateValidationError as e:
-                    st.error(f"Certificate validation failed: {str(e)}")
+                    st.error(f"Certificate validation failed: {e}")
                     st.session_state.signed_pdf = None
-                except Exception as e:
-                    st.error("Signing failed. Please check your certificate and PDF file.")
+                except (SigningError, PlacementError) as e:
+                    st.error(f"Signing failed: {e}")
                     st.session_state.signed_pdf = None
 
             if st.session_state.signed_pdf:
@@ -431,7 +450,7 @@ def main():
                 if page_signatures:
                     st.markdown("**Signatures on this page:**")
 
-                    for idx, (global_idx, sig) in enumerate(page_signatures):
+                    for global_idx, sig in page_signatures:
                         with st.expander(
                             f"Signature #{global_idx + 1}",
                             expanded=(global_idx == st.session_state.selected_signature)
@@ -532,7 +551,8 @@ def main():
         st.session_state.initials_pages = selected_pages
 
         if selected_pages:
-            st.success(f"Initials will be placed on {len(selected_pages)} page(s): {', '.join(str(p+1) for p in sorted(selected_pages))}")
+            pages_str = ', '.join(str(p + 1) for p in sorted(selected_pages))
+            st.success(f"Initials will be placed on {len(selected_pages)} page(s): {pages_str}")
 
         # Preview for initials tab
         st.markdown("---")
