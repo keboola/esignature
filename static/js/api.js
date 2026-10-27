@@ -36,19 +36,25 @@ async function post(path, form) {
   return response;
 }
 
+// Files are passed as {name, bytes} read once when chosen, never as File objects: a File is
+// re-read from disk on upload, so its content could differ from what was previewed.
+function part(file, type) {
+  return [new Blob([file.bytes], { type }), file.name];
+}
+
 /** Returns {name, initials, organization, issuer, valid_from, valid_to}. */
-export async function checkCertificate(p12File, password) {
+export async function checkCertificate(p12, password) {
   const form = new FormData();
-  form.append("p12", p12File);
+  form.append("p12", ...part(p12, "application/x-pkcs12"));
   form.append("password", password);
   return (await post("/api/certificate", form)).json();
 }
 
 /** Returns the signed PDF as a Blob. */
-export async function signDocument({ pdfFile, p12File, password, placements, lock, protocol }) {
+export async function signDocument({ pdf, p12, password, placements, lock, protocol }) {
   const form = new FormData();
-  form.append("pdf", pdfFile);
-  form.append("p12", p12File);
+  form.append("pdf", ...part(pdf, "application/pdf"));
+  form.append("p12", ...part(p12, "application/x-pkcs12"));
   form.append("password", password);
   form.append("placements", JSON.stringify(placements));
   form.append("lock", lock ? "true" : "false");

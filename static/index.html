@@ -67,10 +67,22 @@
           </div>
         </li>
 
+        <li class="step" id="step-options">
+          <h2><span class="step-num">3</span>Options</h2>
+          <label class="check">
+            <input type="checkbox" id="opt-protocol">
+            <span>Add protocol page<small class="muted block">Summary page with certificate and signature details.</small></span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="opt-lock">
+            <span>Lock PDF after signing<small class="muted block">Requests no further changes; enforcement depends on the PDF viewer.</small></span>
+          </label>
+        </li>
+
         <li class="step" id="step-place">
-          <h2><span class="step-num">3</span>Place</h2>
+          <h2><span class="step-num">4</span>Place</h2>
           <button type="button" class="button secondary block" id="add-signature" disabled>+ Add signature</button>
-          <p class="muted small">Click on a page to place. Drag to move. Arrow keys nudge by 1&nbsp;pt (Shift: 10&nbsp;pt), Delete removes.</p>
+          <p class="muted small">Click a page to place, drag to move. Arrows nudge 1&nbsp;pt (Shift 10), Delete removes.</p>
           <ul class="placement-list" id="signature-list"></ul>
 
           <div class="initials-block">
@@ -114,26 +126,18 @@
           </div>
         </li>
 
-        <li class="step" id="step-options">
-          <h2><span class="step-num">4</span>Options</h2>
-          <label class="check">
-            <input type="checkbox" id="opt-protocol">
-            <span>Add protocol page<small class="muted block">A summary page with certificate and signature details.</small></span>
-          </label>
-          <label class="check">
-            <input type="checkbox" id="opt-lock">
-            <span>Lock PDF after signing<small class="muted block">Requests no further changes; enforcement depends on the PDF viewer.</small></span>
-          </label>
-        </li>
 
-        <li class="step" id="step-sign">
-          <h2><span class="step-num">5</span>Sign</h2>
-          <button type="button" class="button primary block" id="sign" disabled>Sign document</button>
-          <p class="muted small" id="sign-hint"></p>
-          <p class="error small" id="sign-error" role="alert" hidden></p>
-          <a class="button success block" id="download" hidden>Download signed PDF</a>
-        </li>
       </ol>
+      <!-- Sign is a footer: the steps above scroll on their own, so nothing is hidden behind it. -->
+      <div class="sign-bar" id="step-sign">
+        <div class="sign-head">
+          <h2><span class="step-num">5</span>Sign</h2>
+          <p class="muted small" id="sign-hint" aria-live="polite"></p>
+        </div>
+        <button type="button" class="button primary block" id="sign" disabled>Sign document</button>
+        <p class="error small" id="sign-error" role="alert" hidden></p>
+        <a class="button success block" id="download" hidden>Download signed PDF</a>
+      </div>
     </aside>
   </main>
 </body>

@@ -37,6 +37,7 @@ const els = {
   certDetails: $("cert-details"),
   addSignature: $("add-signature"),
   placeBanner: $("place-banner"),
+  placeBannerText: $("place-banner-text"),
   placeCancel: $("place-cancel"),
   signatureList: $("signature-list"),
   initialsOn: $("initials-on"),
@@ -59,9 +60,13 @@ const els = {
 const viewer = new Viewer(els.viewer, els.pages);
 const state = createState();
 
+// The PDF and P12 are read ONCE when chosen; signing uploads exactly these bytes, so the signed
+// document is the one that was previewed even if the file changes on disk afterwards.
 const app = {
-  pdfFile: null,
-  p12File: null,
+  pdf: null, // {name, bytes: ArrayBuffer} once read
+  p12: null, // {name, bytes: ArrayBuffer} once read
+  p12Seq: 0,
+  staleNotice: null,
   cert: null, // {name, initials, ...} once the certificate checked out
   certError: null,
   certChecking: false,
@@ -85,12 +90,25 @@ function clearResult() {
   els.signError.textContent = "";
 }
 
-/** Any change to inputs invalidates a signed result and any sign request in flight. */
+/**
+ * Any change to inputs invalidates the signed result. A sign request still in flight keeps Sign
+ * disabled until it finishes, but its response is discarded (see sign()).
+ */
 function changed() {
   app.signSeq += 1;
-  app.signing = false;
+  app.staleNotice = null;
   clearResult();
   render();
+}
+
+function resetInitials() {
+  state.initials = createState().initials;
+  els.initialsOn.checked = state.initials.enabled;
+  els.initialsPages.value = state.initials.preset;
+  els.initialsCustom.value = state.initials.custom;
+  els.initialsCorner.value = state.initials.corner;
+  els.initialsMx.value = String(state.initials.mx);
+  els.initialsMy.value = String(state.initials.my);
 }
 
 // --- Document ------------------------------------------------------------------------------------
@@ -98,26 +116,34 @@ function changed() {
 async function openPdf(file) {
   if (!file) return;
   const seq = ++app.docSeq;
-  app.pdfFile = file;
+  // A new document starts from scratch: no marks, no initials, no result.
+  app.pdf = null;
   state.signatures = [];
   state.pageSizes = [];
   state.selected = null;
+  resetInitials();
   setPlacing(false);
+  viewer.close();
   els.pdfName.textContent = file.name;
   els.docTitle.textContent = file.name;
   els.docInfo.textContent = "Opening…";
   els.emptyState.hidden = true;
   changed();
   try {
-    const sizes = await viewer.open(await file.arrayBuffer());
+    const bytes = await file.arrayBuffer();
+    if (seq !== app.docSeq) return; // a newer file was chosen meanwhile
+    // PDF.js takes ownership of the buffer it gets, so it gets a copy.
+    const sizes = await viewer.open(bytes.slice(0));
     if (seq !== app.docSeq) return;
+    app.pdf = { name: file.name, bytes };
     state.pageSizes = sizes;
     autoFit = true;
     viewer.setScale(viewer.fitWidthScale());
     els.docInfo.textContent = `${sizes.length} page${sizes.length === 1 ? "" : "s"}`;
   } catch (error) {
     if (seq !== app.docSeq || error?.message === "superseded") return;
-    app.pdfFile = null;
+    app.pdf = null;
+    viewer.close();
     els.docInfo.textContent = "";
     els.docTitle.textContent = "No document open";
     els.pdfName.textContent = "No file chosen";
@@ -127,6 +153,26 @@ async function openPdf(file) {
       : "This file could not be opened as a PDF.");
   }
   render();
+}
+
+async function openP12(file) {
+  const seq = ++app.p12Seq;
+  app.p12 = null;
+  els.p12Name.textContent = file ? file.name : "No file chosen";
+  certificateChanged();
+  if (!file) return;
+  try {
+    const bytes = await file.arrayBuffer();
+    if (seq !== app.p12Seq) return;
+    app.p12 = { name: file.name, bytes };
+  } catch {
+    if (seq !== app.p12Seq) return;
+    certificateChanged();
+    app.certError = "The certificate file could not be read.";
+    render();
+    return;
+  }
+  certificateChanged();
 }
 
 function showError(message) {
@@ -144,7 +190,7 @@ function certificateChanged() {
   app.certSeq += 1;
   changed();
   clearTimeout(certTimer);
-  if (app.p12File) certTimer = setTimeout(runCertificateCheck, 350);
+  if (app.p12) certTimer = setTimeout(runCertificateCheck, 350);
 }
 
 async function runCertificateCheck() {
@@ -152,7 +198,7 @@ async function runCertificateCheck() {
   app.certChecking = true;
   render();
   try {
-    const info = await checkCertificate(app.p12File, els.password.value);
+    const info = await checkCertificate(app.p12, els.password.value);
     if (seq !== app.certSeq) return;
     app.cert = info;
   } catch (error) {
@@ -168,6 +214,7 @@ async function runCertificateCheck() {
 
 function setPlacing(on) {
   app.placing = on && state.pageSizes.length > 0;
+  els.placeBannerText.textContent = "Click on a page to place your signature";
   els.placeBanner.hidden = !app.placing;
   els.viewer.classList.toggle("placing", app.placing);
 }
@@ -189,6 +236,13 @@ els.pages.addEventListener("pointerdown", (event) => {
   }
   event.preventDefault();
   const page = Number(overlay.dataset.pageIndex);
+  const size = state.pageSizes[page];
+  if (size.width < BOX.signature.w || size.height < BOX.signature.h) {
+    // Stay armed: the user can click another page.
+    els.placeBannerText.textContent = `Page ${page + 1} is too small for a signature `
+      + `(${BOX.signature.w} × ${BOX.signature.h} pt). Click another page.`;
+    return;
+  }
   const point = overlayPoint(overlay, event);
   const signature = addSignature(state, page, point.x, point.y);
   state.selected = { kind: "signature", id: signature.id };
@@ -318,8 +372,11 @@ document.addEventListener("keydown", (event) => {
     }
     return;
   }
+  // Keys edit marks only when focus is on a mark or on nothing interactive (never on a link,
+  // button or form field, e.g. the Download link).
   const target = event.target;
-  if (target instanceof HTMLElement && target.closest("input, select, textarea, button:not(.mark)")) return;
+  if (target instanceof Element && !target.closest(".mark")
+      && target.closest("a, button, input, select, textarea, [contenteditable]")) return;
   const mark = selectedMark();
   if (!mark || app.drag) return;
   const step = event.shiftKey ? 10 : 1;
@@ -501,15 +558,16 @@ function renderInitials() {
   }
   els.initialsWarning.textContent = messages.join(" ");
   els.initialsWarning.hidden = messages.length === 0;
-  return { instances, misfit, error };
+  return { instances, misfit, error, messages };
 }
 
 function signBlocker(initials) {
-  if (!app.pdfFile || !state.pageSizes.length) return "Choose a PDF document.";
-  if (!app.p12File) return "Choose your P12 / PFX certificate.";
+  if (!app.pdf || !state.pageSizes.length) return "Choose a PDF document.";
+  if (!app.p12) return "Choose your P12 / PFX certificate.";
   if (app.certChecking) return "Checking the certificate…";
   if (!app.cert) return app.certError ? "Fix the certificate or password." : "Checking the certificate…";
-  if (state.initials.enabled && (initials.error || initials.misfit.length)) return "Fix the initials settings.";
+  // Say exactly what is wrong: the initials settings may be scrolled out of view.
+  if (state.initials.enabled && (initials.error || initials.misfit.length)) return initials.messages.join(" ");
   if (!state.signatures.length && !initials.instances.length) return "Add a signature or initials.";
   return null;
 }
@@ -526,38 +584,50 @@ function render() {
   const blocker = signBlocker(initials);
   els.sign.disabled = Boolean(blocker) || app.signing;
   els.sign.textContent = app.signing ? "Signing…" : "Sign document";
-  els.signHint.textContent = app.signing ? "" : blocker || (app.resultUrl ? "" : "Ready to sign.");
+  let hint = blocker || (app.resultUrl ? "" : "Ready to sign.");
+  if (app.signing) hint = app.signSeq === app.signingSeq ? "" : "Inputs changed; this result will be discarded.";
+  else if (app.staleNotice) hint = app.staleNotice;
+  els.signHint.textContent = hint;
 }
 
 // --- Signing -------------------------------------------------------------------------------------
 
 async function sign() {
-  if (els.sign.disabled) return;
+  if (els.sign.disabled || app.signing) return;
   const seq = ++app.signSeq;
+  const pdfName = app.pdf.name;
   clearResult();
-  app.signing = true;
+  app.staleNotice = null;
+  app.signing = true; // only cleared when THIS request finishes, whatever changes meanwhile
+  app.signingSeq = seq;
   render();
   try {
     const blob = await signDocument({
-      pdfFile: app.pdfFile,
-      p12File: app.p12File,
+      pdf: app.pdf,
+      p12: app.p12,
       password: els.password.value,
       placements: placementsPayload(state),
       lock: els.optLock.checked,
       protocol: els.optProtocol.checked,
     });
-    if (seq !== app.signSeq) return;
+    if (seq !== app.signSeq) {
+      app.staleNotice = "The document or settings changed while signing. Sign again to get an up-to-date file.";
+      return;
+    }
     app.resultUrl = URL.createObjectURL(blob);
     els.download.href = app.resultUrl;
-    els.download.download = signedName(app.pdfFile.name);
+    els.download.download = signedName(pdfName);
     els.download.hidden = false;
   } catch (error) {
-    if (seq !== app.signSeq) return;
+    if (seq !== app.signSeq) {
+      app.staleNotice = "The document or settings changed while signing. Sign again to get an up-to-date file.";
+      return;
+    }
     showError(error.message);
   } finally {
-    if (seq === app.signSeq) app.signing = false;
+    app.signing = false;
+    render();
   }
-  render();
 }
 
 function signedName(name) {
@@ -589,9 +659,9 @@ els.viewer.addEventListener("drop", (event) => {
 });
 
 els.p12Input.addEventListener("change", () => {
-  app.p12File = els.p12Input.files?.[0] || null;
-  els.p12Name.textContent = app.p12File ? app.p12File.name : "No file chosen";
-  certificateChanged();
+  const file = els.p12Input.files?.[0] || null;
+  els.p12Input.value = "";
+  openP12(file);
 });
 els.password.addEventListener("input", certificateChanged);
 

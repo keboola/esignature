@@ -171,15 +171,18 @@ button:disabled { opacity: 0.45; cursor: default; }
 .panel {
   width: var(--panel-width);
   flex: none;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   border-left: 1px solid var(--border);
   background: var(--surface);
 }
-.steps { list-style: none; margin: 0; padding: 0; }
-.step { padding: 16px 20px 18px; border-bottom: 1px solid var(--border); }
-.step h2 {
+.steps { list-style: none; margin: 0; padding: 0; flex: 1; min-height: 0; overflow-y: auto; }
+.step { padding: 12px 20px 14px; border-bottom: 1px solid var(--border); }
+.step:last-child { border-bottom: none; }
+.step h2, .sign-bar h2 {
   display: flex; align-items: center; gap: 10px;
-  margin: 0 0 12px; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase;
+  margin: 0 0 10px; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase;
 }
 .step-num {
   display: inline-flex; align-items: center; justify-content: center;
@@ -251,11 +254,15 @@ button:disabled { opacity: 0.45; cursor: default; }
 .placement-item.selected { border-color: var(--accent); background: var(--accent-soft); }
 .placement-go { border: none; background: none; padding: 6px 0; cursor: pointer; text-align: left; flex: 1; font-weight: 500; }
 
-/* Sign stays reachable at the bottom of the panel. */
-#step-sign {
-  position: sticky; bottom: 0; background: var(--surface); border-bottom: none;
-  box-shadow: 0 -1px 0 var(--border), 0 -8px 16px rgba(16, 24, 40, 0.04);
+/* Sign is a compact footer; the steps scroll above it. */
+.sign-bar {
+  flex: none; padding: 12px 20px 14px; border-top: 1px solid var(--border); background: var(--surface);
+  box-shadow: 0 -8px 16px rgba(16, 24, 40, 0.04);
 }
+.sign-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; min-width: 0; }
+.sign-head h2 { margin: 0; flex: none; }
+.sign-head p { margin: 0; min-width: 0; }
+.sign-bar p { margin: 8px 0 0; }
 
 .initials-block { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--border); }
 .initials-options { margin-top: 4px; }
@@ -266,7 +273,8 @@ button:disabled { opacity: 0.45; cursor: default; }
   .layout { flex-direction: column; }
   .viewer { flex: none; height: 62vh; }
   .panel { width: auto; border-left: none; border-top: 1px solid var(--border); overflow: visible; }
-  #step-sign { position: static; box-shadow: none; }
+  .steps { overflow: visible; }
+  .sign-bar { box-shadow: none; }
   body { height: auto; min-height: 100%; }
   .layout { min-height: auto; }
   .pages { padding: 16px 12px 48px; }

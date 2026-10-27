@@ -279,3 +279,142 @@ def test_wrong_password_shows_error_and_blocks_signing(page: Page, base_url, tmp
     expect(page.locator("#cert-status.bad")).to_contain_text("wrong password")
     place(page, 0, 200, 200, 595)
     expect(page.locator("#sign")).to_be_disabled()
+
+
+# --- Fix round 1 regressions -------------------------------------------------------------------
+
+def text_pdf(text: str, pages: int = 1, width: float = 595, height: float = 842) -> bytes:
+    doc = pymupdf.open()
+    for _ in range(pages):
+        doc.new_page(width=width, height=height).insert_text((72, 100), text, fontsize=14)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_signs_the_bytes_that_were_previewed_even_if_the_file_changes_on_disk(
+        page: Page, base_url, tmp_path, identity):
+    open_editor(page, base_url, tmp_path, text_pdf("PRICE: 1000 EUR"), identity)
+    place(page, 0, 300, 400, 595)
+    write(tmp_path, "doc.pdf", text_pdf("PRICE: 9999 EUR"))  # same path, new content
+    write(tmp_path, "cert.p12", b"garbage")
+    signed = sign_and_download(page)
+    with pymupdf.open(stream=signed, filetype="pdf") as doc:
+        text = doc[0].get_text()
+    assert "PRICE: 1000 EUR" in text and "9999" not in text
+
+
+SLOW_READ = """
+const original = File.prototype.arrayBuffer;
+File.prototype.arrayBuffer = function () {
+  if (this.name === "slow.pdf") {
+    return new Promise((resolve) => setTimeout(() => resolve(original.call(this)), 1500));
+  }
+  return original.call(this);
+};
+"""
+
+
+def test_a_slow_earlier_file_read_never_replaces_the_newer_document(page: Page, base_url, tmp_path):
+    page.add_init_script(SLOW_READ)
+    page.goto(base_url)
+    page.set_input_files("#pdf-input", write(tmp_path, "slow.pdf", text_pdf("A", 2, 842, 595)))
+    page.set_input_files("#pdf-input", write(tmp_path, "fast.pdf", text_pdf("B", 1)))
+    expect(page.locator('.page[data-page-index="0"][data-rendered="true"]')).to_be_visible()
+    page.wait_for_timeout(2500)  # the slow read has resolved by now
+    expect(page.locator(".page")).to_have_count(1)
+    expect(page.locator("#doc-info")).to_have_text("1 page")
+    expect(page.locator("#pdf-name")).to_have_text("fast.pdf")
+    box = overlay_box(page, 0)
+    assert box["height"] > box["width"]  # portrait B, not landscape A
+
+
+def test_replacing_the_pdf_resets_initials(page: Page, base_url, tmp_path, identity):
+    open_editor(page, base_url, tmp_path, blank_pdf(2), identity)
+    page.check("#initials-on")
+    expect(page.locator(".mark-initials")).to_have_count(2)
+    page.set_input_files("#pdf-input", write(tmp_path, "other.pdf", blank_pdf(1)))
+    expect(page.locator("#doc-info")).to_have_text("1 page")
+    expect(page.locator("#initials-on")).not_to_be_checked()
+    expect(page.locator("#initials-options")).to_be_hidden()
+    expect(page.locator(".mark-initials")).to_have_count(0)
+    expect(page.locator("#sign")).to_be_disabled()
+
+
+SLOW_SIGN = """
+window.__signCalls = 0;
+const originalFetch = window.fetch;
+window.fetch = async (input, init) => {
+  if (String(input).includes("/api/sign")) {
+    window.__signCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  return originalFetch(input, init);
+};
+"""
+
+
+def test_editing_while_signing_keeps_sign_disabled_and_discards_the_stale_result(
+        page: Page, base_url, tmp_path, identity):
+    page.add_init_script(SLOW_SIGN)
+    open_editor(page, base_url, tmp_path, blank_pdf(1), identity)
+    place(page, 0, 300, 400, 595)
+    page.click("#sign")
+    page.check("#opt-protocol")  # an edit while the request is in flight
+    expect(page.locator("#sign")).to_be_disabled()
+    expect(page.locator("#sign-hint")).to_contain_text("changed while signing", timeout=10_000)
+    expect(page.locator("#download")).to_be_hidden()
+    assert page.evaluate("window.__signCalls") == 1
+    signed = sign_and_download(page)
+    assert page.evaluate("window.__signCalls") == 2
+    with pymupdf.open(stream=signed, filetype="pdf") as doc:
+        assert doc.page_count == 2  # the protocol page chosen during the first request
+
+
+def test_keys_on_the_download_link_do_not_edit_the_document(page: Page, base_url, tmp_path, identity):
+    open_editor(page, base_url, tmp_path, blank_pdf(1), identity)
+    x, y = place(page, 0, 300, 400, 595)
+    sign_and_download(page)
+    page.focus("#download")
+    for key in ("ArrowRight", "ArrowDown", "Backspace", "Delete"):
+        page.keyboard.press(key)
+    assert mark_data(page, ".mark-signature") == pytest.approx((x, y))
+    expect(page.locator("#download")).to_be_visible()
+
+
+def test_signature_cannot_be_placed_on_a_page_smaller_than_the_box(page: Page, base_url, tmp_path, identity):
+    doc = pymupdf.open()
+    doc.new_page(width=120, height=40)
+    doc.new_page(width=595, height=842)
+    pdf = doc.tobytes()
+    open_editor(page, base_url, tmp_path, pdf, identity)
+    page.click("#add-signature")
+    box = overlay_box(page, 0)
+    page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    expect(page.locator(".mark-signature")).to_have_count(0)
+    expect(page.locator("#place-banner")).to_contain_text("too small")
+
+
+def test_initials_misfit_reason_is_shown_next_to_sign(page: Page, base_url, tmp_path, identity):
+    open_editor(page, base_url, tmp_path, blank_pdf(3), identity)
+    page.check("#initials-on")
+    page.fill("#initials-my", "900")
+    expect(page.locator("#sign-hint")).to_contain_text("pages 1-3")
+    expect(page.locator("#sign")).to_be_disabled()
+
+
+def test_all_five_steps_are_visible_without_scrolling_at_1280x800(page: Page, base_url, tmp_path, identity):
+    page.set_viewport_size({"width": 1280, "height": 800})
+    open_editor(page, base_url, tmp_path, blank_pdf(2), identity)
+    place(page, 0, 300, 400, 595)
+    page.check("#initials-on")
+    page.eval_on_selector(".steps", "el => { el.scrollTop = 0; }")  # as the user first sees it
+    for selector in ("#step-document h2", "#step-certificate h2", "#step-options h2", "#opt-protocol",
+                     "#opt-lock", "#step-place h2", "#add-signature", "#step-sign h2", "#sign"):
+        box = page.locator(selector).bounding_box()
+        assert box["y"] >= 0 and box["y"] + box["height"] <= 800, f"{selector} is off screen"
+        hit = page.evaluate(
+            "([x, y, sel]) => { const el = document.elementFromPoint(x, y);"
+            " return !!el && (el.closest(sel) !== null || el.contains(document.querySelector(sel))); }",
+            [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, selector])
+        assert hit, f"{selector} is covered"

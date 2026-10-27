@@ -50,19 +50,22 @@ app at startup with a message naming the variable.
 | `ESIGN_MAX_P12_KB` | `256` | Largest certificate file accepted |
 | `ESIGN_MAX_PLACEMENTS` | `1000` | Most signatures + initials in one signing |
 | `ESIGN_MAX_IN_FLIGHT` | `2` | Requests handled at once; more get "busy, try again" |
+| `ESIGN_BODY_TIMEOUT_S` | `30` | Seconds allowed to upload a request; slower uploads are cut off |
 
 ## How to use
 
-1. **Document** – choose a PDF (or drop it onto the page area). It is opened in the browser.
+1. **Document** – choose a PDF (or drop it onto the page area). It is read once and opened in
+   the browser; signing uses exactly those bytes, even if the file changes on disk later.
 2. **Certificate** – choose your `.p12`/`.pfx` file and type its password (leave it empty if the
    certificate has none). The app checks it and shows the name, issuer and validity.
-3. **Place** – click "Add signature", then click on a page. Drag the box to fine-tune it, or
+3. **Options** – add a protocol page and/or lock the PDF.
+4. **Place** – click "Add signature", then click on a page. Drag the box to fine-tune it, or
    select it and use the arrow keys. Turn on "Initials on pages" for a paraph on each page.
    The boxes show a preview; the real mark contains your name, the signing time and a link.
-4. **Options** – add a protocol page and/or lock the PDF.
 5. **Sign** – click "Sign document", then "Download signed PDF".
 
-Encrypted PDFs and PDFs that already carry a signature are rejected with a clear message.
+Encrypted PDFs, PDFs that already carry a signature, and pages with a /Rotate that is not a
+multiple of 90 degrees are rejected with a clear message.
 
 ## Security notes
 

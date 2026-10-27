@@ -38,11 +38,14 @@ export class Viewer {
     });
   }
 
-  /** Opens a PDF; resolves to the page sizes in points as displayed. Replaces any open document. */
+  /**
+   * Opens a PDF; resolves to the page sizes in points as displayed. Replaces any open document.
+   * Generation-safe: a newer open() or close() supersedes this one, which then rejects with
+   * "superseded" without touching the viewer.
+   */
   async open(data) {
-    await this.close();
-    const generation = this.generation;
-    this.loadingTask = pdfjsLib.getDocument({
+    const generation = this.#reset();
+    const task = pdfjsLib.getDocument({
       data,
       cMapUrl: `${PDFJS_BASE}cmaps/`,
       cMapPacked: true,
@@ -52,28 +55,36 @@ export class Viewer {
       isEvalSupported: false,
       enableXfa: false,
     });
-    const doc = await this.loadingTask.promise;
-    if (generation !== this.generation) {
-      doc.destroy();
-      throw new Error("superseded");
+    this.loadingTask = task; // so a later reset can destroy it
+    const superseded = () => generation !== this.generation;
+    try {
+      const doc = await task.promise;
+      const sizes = [];
+      for (let i = 1; i <= doc.numPages && !superseded(); i += 1) {
+        const page = await doc.getPage(i);
+        const viewport = page.getViewport({ scale: 1 });
+        sizes.push({ width: viewport.width, height: viewport.height });
+      }
+      if (superseded()) throw new Error("superseded");
+      this.doc = doc;
+      this.sizes = sizes;
+      this.#buildSlots();
+      return sizes;
+    } catch (error) {
+      if (superseded()) {
+        task.destroy();
+        throw new Error("superseded");
+      }
+      throw error;
     }
-    const sizes = [];
-    for (let i = 1; i <= doc.numPages; i += 1) {
-      const page = await doc.getPage(i);
-      const viewport = page.getViewport({ scale: 1 });
-      sizes.push({ width: viewport.width, height: viewport.height });
-    }
-    if (generation !== this.generation) {
-      doc.destroy();
-      throw new Error("superseded");
-    }
-    this.doc = doc;
-    this.sizes = sizes;
-    this.#buildSlots();
-    return sizes;
   }
 
-  async close() {
+  close() {
+    this.#reset();
+  }
+
+  /** Synchronously drops the current document and returns the new generation number. */
+  #reset() {
     this.generation += 1;
     this.observer.disconnect();
     for (const slot of this.slots) slot.task?.cancel();
@@ -84,7 +95,8 @@ export class Viewer {
     this.loadingTask = null;
     this.doc = null;
     this.sizes = [];
-    if (task) await task.destroy();
+    task?.destroy();
+    return this.generation;
   }
 
   fitWidthScale() {
