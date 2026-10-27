@@ -415,7 +415,13 @@ def main():
     page_count = get_pdf_page_count(pdf_bytes)
 
     # A replaced PDF may have fewer pages: drop placements on pages that no longer exist
-    st.session_state.signatures = [s for s in st.session_state.signatures if s["page"] < page_count]
+    kept = [s for s in st.session_state.signatures if s["page"] < page_count]
+    if len(kept) != len(st.session_state.signatures):
+        st.session_state.signatures = kept
+        # Per-signature widgets are keyed by list index; after removal the indexes shift, so
+        # drop their state and let the sliders re-seed from the stored coordinates.
+        for key in [k for k in st.session_state if str(k).startswith(("sig_x_", "sig_y_", "del_"))]:
+            del st.session_state[key]
     st.session_state.initials_pages = [p for p in st.session_state.initials_pages if p < page_count]
     if "initials_multiselect" in st.session_state:
         st.session_state.initials_multiselect = [

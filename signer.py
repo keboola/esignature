@@ -616,6 +616,11 @@ def _append_protocol_pages(
 MAX_FIELD_TREE_DEPTH = 64
 
 
+def _deref(value: Any) -> Any:
+    """Resolve an indirect reference to its object; other values are returned unchanged."""
+    return value.get_object() if isinstance(value, generic.IndirectObject) else value
+
+
 def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
     """All fully qualified field names in the AcroForm tree plus every parent prefix.
 
@@ -623,12 +628,13 @@ def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
     collides with an existing field or with the parent of one (e.g. "Signature_1.child").
     """
     names: Set[str] = set()
-    acroform = reader.root.get("/AcroForm")
-    if acroform is None:
+    acroform = _deref(reader.root.get("/AcroForm"))
+    if not isinstance(acroform, generic.DictionaryObject):
         return names
     seen: Set[Tuple[int, int]] = set()
 
     def walk(items: Any, prefix: str, depth: int) -> None:
+        items = _deref(items)
         if depth > MAX_FIELD_TREE_DEPTH or not isinstance(items, generic.ArrayObject):
             return
         for item in items:
@@ -646,14 +652,14 @@ def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
             field = item.get_object()
             if not isinstance(field, generic.DictionaryObject):
                 continue
-            partial = field.get("/T")
+            partial = _deref(field.get("/T"))
             name = prefix
             if partial is not None:
                 name = f"{prefix}.{partial}" if prefix else str(partial)
                 names.add(name)
             walk(field.get("/Kids"), name, depth + 1)
 
-    walk(acroform.get_object().get("/Fields"), "", 0)
+    walk(acroform.get("/Fields"), "", 0)
     for name in list(names):
         parts = name.split(".")
         names.update(".".join(parts[:i]) for i in range(1, len(parts)))

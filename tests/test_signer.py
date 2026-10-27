@@ -347,6 +347,44 @@ def test_widgetless_existing_signature_field_is_not_reused(identity):
     assert signature.docmdp_level == MDPPerm.NO_CHANGES
 
 
+def empty_widget_field(doc, title_source):
+    """Add an unsigned signature widget/field on page 0; returns its xref."""
+    field = doc.get_new_xref()
+    page_xref = doc[0].xref
+    doc.update_object(
+        field,
+        f"<< /Type /Annot /Subtype /Widget /FT /Sig /T {title_source} /Rect [10 10 60 40] "
+        f"/P {page_xref} 0 R /F 4 >>",
+    )
+    doc.xref_set_key(page_xref, "Annots", f"[{field} 0 R]")
+    return field
+
+
+def test_indirect_fields_array_is_read(identity):
+    def fields_source(doc):
+        field = empty_widget_field(doc, "(Signature_1)")
+        array = doc.get_new_xref()
+        doc.update_object(array, f"[{field} 0 R]")
+        return f"{array} 0 R"
+
+    out = sign(pdf_with_acroform(fields_source), identity, [sig()])
+
+    (signature, _), = assert_all_signatures_ok(out, identity, expected=1)
+    assert signature.field_name == "Signature_2"
+
+
+def test_indirect_field_title_is_read(identity):
+    def fields_source(doc):
+        title = doc.get_new_xref()
+        doc.update_object(title, "(Signature_1)")
+        return f"[{empty_widget_field(doc, f'{title} 0 R')} 0 R]"
+
+    out = sign(pdf_with_acroform(fields_source), identity, [sig()])
+
+    (signature, _), = assert_all_signatures_ok(out, identity, expected=1)
+    assert signature.field_name == "Signature_2"
+
+
 def test_inline_field_dictionary_is_rejected_clearly(identity):
     """PDF requires indirect field references; pyhanko cannot extend such a form safely."""
     pdf = pdf_with_acroform(lambda doc: "[<< /FT /Sig /T (Signature_1) >>]")
