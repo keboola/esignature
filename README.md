@@ -24,8 +24,8 @@ The application provides a clean interface with:
 
 ### Prerequisites
 
-- Python 3.9+
-- pip
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/)
 
 ### Setup
 
@@ -35,23 +35,24 @@ The application provides a clean interface with:
    cd esignature
    ```
 
-2. Create and activate a virtual environment:
+2. Install dependencies (creates `.venv` from `uv.lock`):
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   uv sync
    ```
 
-3. Install dependencies:
+3. Run the application:
    ```bash
-   pip install -r requirements.txt
+   uv run streamlit run app.py
    ```
 
-4. Run the application:
-   ```bash
-   streamlit run app.py
-   ```
+4. Open your browser at `http://localhost:8501`
 
-5. Open your browser at `http://localhost:8501`
+### Tests
+
+```bash
+uv run pytest
+uv run ruff check
+```
 
 ## Usage
 
@@ -105,12 +106,15 @@ The application provides a clean interface with:
 esignature/
 ├── app.py              # Streamlit application
 ├── signer.py           # PDF signing logic
+├── geometry.py         # Placement contract and page geometry
+├── tests/              # pytest suite
 ├── fonts/
 │   ├── DancingScript-Regular.ttf  # Signature font (OFL licensed)
 │   └── OFL.txt         # Font license
 ├── docs/
 │   └── screenshot.png  # Application screenshot
-├── requirements.txt    # Python dependencies
+├── pyproject.toml      # Project and dependencies (uv)
+├── uv.lock             # Locked dependency versions
 ├── LICENSE             # MIT License
 └── README.md
 ```

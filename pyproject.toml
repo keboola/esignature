@@ -1,0 +1,39 @@
+[project]
+name = "esignature"
+version = "0.1.0"
+description = "Keboola eSignature - sign PDF documents with P12/PFX certificates"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=41.0.0",
+    "pillow>=10.0.0",
+    "pyhanko>=0.38.0",
+    "pyhanko-certvalidator>=0.33.0",
+    "pymupdf>=1.26.0",
+    "streamlit>=1.49.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.3",
+]
