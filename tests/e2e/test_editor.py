@@ -418,3 +418,34 @@ def test_all_five_steps_are_visible_without_scrolling_at_1280x800(page: Page, ba
             " return !!el && (el.closest(sel) !== null || el.contains(document.querySelector(sel))); }",
             [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, selector])
         assert hit, f"{selector} is covered"
+
+
+STALLED_CERT_CHECK = """
+window.__certCalls = 0;
+const originalFetch = window.fetch;
+window.fetch = async (input, init) => {
+  if (String(input).includes("/api/certificate")) {
+    window.__certCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  return originalFetch(input, init);
+};
+const originalRead = File.prototype.arrayBuffer;
+File.prototype.arrayBuffer = function () {
+  if (this.name === "unreadable.p12") return Promise.reject(new DOMException("gone", "NotReadableError"));
+  return originalRead.call(this);
+};
+"""
+
+
+def test_certificate_status_matches_state_after_a_check_is_superseded_by_a_failed_read(
+        page: Page, base_url, tmp_path, identity):
+    page.add_init_script(STALLED_CERT_CHECK)
+    page.goto(base_url)
+    page.fill("#password", identity.password)
+    page.set_input_files("#p12-input", write(tmp_path, "good.p12", identity.p12))
+    page.wait_for_function("() => window.__certCalls === 1")  # check A is now pending
+    page.set_input_files("#p12-input", write(tmp_path, "unreadable.p12", b"x"))
+    page.wait_for_timeout(2500)  # check A has resolved by now
+    expect(page.locator("#cert-status")).to_have_class(re.compile(r"\bbad\b"))
+    expect(page.locator("#cert-name")).to_have_text("The certificate file could not be read.")

@@ -187,6 +187,9 @@ let certTimer = null;
 function certificateChanged() {
   app.cert = null;
   app.certError = null;
+  // Any check in flight is now stale (its response is ignored), so it must not keep the
+  // status on "Checking…"; a new check sets this again when it starts.
+  app.certChecking = false;
   app.certSeq += 1;
   changed();
   clearTimeout(certTimer);
