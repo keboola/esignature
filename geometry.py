@@ -98,6 +98,11 @@ def _raw_page_rotation(page: pymupdf.Page) -> Optional[float]:
     xref = page.xref
     for _ in range(64):  # bounded walk up the page tree
         kind, value = doc.xref_get_key(xref, "Rotate")
+        if kind == "xref":  # indirect reference such as "5 0 R": read the referenced object
+            try:
+                value = doc.xref_object(int(value.split()[0]), compressed=True).strip()
+            except (ValueError, RuntimeError):
+                return None
         if kind not in ("null", "undefined"):
             try:
                 return float(value)

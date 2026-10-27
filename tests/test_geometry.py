@@ -154,3 +154,33 @@ def test_validate_rejects_rotation_that_is_not_a_multiple_of_90(value, on_parent
 def test_validate_accepts_rotation_multiples_of_90(value):
     with pymupdf.open(stream=_pdf_with_rotate(value), filetype="pdf") as doc:
         assert validate_placements(doc, [{"page": 0, "type": "signature", "x": 10, "y": 10}])
+
+
+def _pdf_with_indirect_rotate(value: str, on_parent: bool) -> bytes:
+    doc = pymupdf.open()
+    page = doc.new_page(width=600, height=800)
+    rotate_xref = doc.get_new_xref()
+    doc.update_object(rotate_xref, value)
+    if on_parent:
+        parent = int(doc.xref_get_key(page.xref, "Parent")[1].split()[0])
+        doc.xref_set_key(parent, "Rotate", f"{rotate_xref} 0 R")
+        doc.xref_set_key(page.xref, "Rotate", "null")
+    else:
+        doc.xref_set_key(page.xref, "Rotate", f"{rotate_xref} 0 R")
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+@pytest.mark.parametrize("value, on_parent", [("90", True), ("270", False)])
+def test_validate_accepts_indirect_rotation_multiple_of_90(value, on_parent):
+    with pymupdf.open(stream=_pdf_with_indirect_rotate(value, on_parent), filetype="pdf") as doc:
+        assert doc[0].rotation == int(value)
+        assert validate_placements(doc, [{"page": 0, "type": "signature", "x": 100, "y": 100}])
+
+
+@pytest.mark.parametrize("on_parent", [True, False])
+def test_validate_rejects_indirect_rotation_not_multiple_of_90(on_parent):
+    with pymupdf.open(stream=_pdf_with_indirect_rotate("45", on_parent), filetype="pdf") as doc:
+        with pytest.raises(PlacementError, match="rotation"):
+            validate_placements(doc, [{"page": 0, "type": "signature", "x": 100, "y": 100}])
