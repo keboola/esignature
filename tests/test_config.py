@@ -34,7 +34,8 @@ def test_non_loopback_host_is_rejected(host):
 @pytest.mark.parametrize("name, value", [
     ("ESIGN_PORT", "abc"), ("ESIGN_PORT", "0"), ("ESIGN_PORT", "70000"),
     ("ESIGN_MAX_PDF_MB", "-1"), ("ESIGN_MAX_P12_KB", "1.5"), ("ESIGN_MAX_PLACEMENTS", "0"),
-    ("ESIGN_MAX_IN_FLIGHT", "100"),
+    ("ESIGN_MAX_IN_FLIGHT", "100"), ("ESIGN_MAX_EXISTING_SIGNATURES", "0"),
+    ("ESIGN_MAX_EXISTING_SIGNATURES", "many"),
 ])
 def test_invalid_values_name_the_variable(name, value):
     with pytest.raises(ConfigError, match=name):
@@ -51,3 +52,8 @@ def test_body_timeout_setting():
     assert load_settings({"ESIGN_BODY_TIMEOUT_S": "5"}).body_timeout_s == 5
     with pytest.raises(ConfigError, match="ESIGN_BODY_TIMEOUT_S"):
         load_settings({"ESIGN_BODY_TIMEOUT_S": "0"})
+
+
+def test_max_existing_signatures_setting():
+    assert load_settings({}).max_existing_signatures == 20
+    assert load_settings({"ESIGN_MAX_EXISTING_SIGNATURES": "3"}).max_existing_signatures == 3

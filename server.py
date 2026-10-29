@@ -79,8 +79,12 @@ class ApiError(Exception):
         self.message = message
 
 
-def error_response(status: int, message: str) -> JSONResponse:
-    return JSONResponse({"error": message}, status_code=status)
+def error_response(status: int, message: str, code: Optional[str] = None) -> JSONResponse:
+    """JSON error body {error, code?}; ``code`` is a machine-readable reason for the frontend."""
+    body = {"error": message}
+    if code:
+        body["code"] = code
+    return JSONResponse(body, status_code=status)
 
 
 async def _send_error(send: Send, status: int, message: str) -> None:
@@ -344,7 +348,9 @@ async def run_admitted(
         return await asyncio.wrap_future(future)
     except ApiError as e:
         return error_response(e.status, e.message)
-    except (CertificateValidationError, PdfInputError, PlacementError) as e:
+    except PdfInputError as e:
+        return error_response(400, str(e), e.code)
+    except (CertificateValidationError, PlacementError) as e:
         return error_response(400, str(e))
     except SigningError as e:
         return error_response(500, str(e))
@@ -386,12 +392,14 @@ def certificate_job(p12: bytes, password: str) -> Callable[[], Response]:
 
 def sign_job(
     pdf: bytes, p12: bytes, password: str, placements: Any, lock: bool, protocol: bool,
-    max_placements: int,
+    settings: Settings,
 ) -> Callable[[], Response]:
     def job() -> Response:
         signed = sign_pdf_multiple(
             pdf, p12, password, placements,
-            lock_after_signing=lock, add_protocol_page=protocol, max_placements=max_placements,
+            lock_after_signing=lock, add_protocol_page=protocol,
+            max_placements=settings.max_placements,
+            max_existing_signatures=settings.max_existing_signatures,
         )
         return Response(signed, media_type="application/pdf",
                         headers={"Content-Disposition": 'attachment; filename="signed.pdf"'})
@@ -442,7 +450,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             protocol = parse_flag(form, "protocol")
             check_size(pdf, settings.max_pdf_bytes, "PDF")
             check_size(p12, settings.max_p12_bytes, "certificate file")
-            return sign_job(pdf, p12, password, placements, lock, protocol, settings.max_placements)
+            return sign_job(pdf, p12, password, placements, lock, protocol, settings)
 
         return await run_admitted(
             request, {"pdf", "p12"}, {"password", "placements", "lock", "protocol"}, prepare)

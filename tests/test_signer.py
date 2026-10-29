@@ -198,13 +198,17 @@ def test_user_unit_page_is_rejected(identity):
 
 # --- D8: input policy --------------------------------------------------------------------
 
-def test_already_signed_pdf_is_rejected(identity):
+def test_already_signed_pdf_is_countersigned_not_rejected(identity):
+    """PR 3 replaced the blanket refusal: signed input is counter-signed incrementally."""
     writer = IncrementalPdfFileWriter(io.BytesIO(make_pdf()))
     signer = signers.SimpleSigner.load_pkcs12_data(identity.p12, [], identity.password.encode())
     signed = signers.sign_pdf(writer, signers.PdfSignatureMetadata(field_name="Existing"), signer=signer)
 
-    with pytest.raises(PdfInputError, match="already signed"):
-        sign(signed.getvalue(), identity, [sig()])
+    out = sign(signed.getvalue(), identity, [sig()])
+
+    assert out.startswith(signed.getvalue())
+    results = assert_all_signatures_ok(out, identity, expected=2)
+    assert [s.field_name for s, _ in results] == ["Existing", "Signature_1"]
 
 
 @pytest.mark.parametrize("user_pw", ["", "open-me"])
@@ -423,7 +427,7 @@ def test_signed_then_resaved_pdf_is_rejected(identity):
     signed = signers.sign_pdf(writer, signers.PdfSignatureMetadata(field_name="X"), signer=signer)
     resaved = pymupdf.open(stream=signed.getvalue(), filetype="pdf").tobytes(garbage=3)
 
-    with pytest.raises(PdfInputError, match="already signed"):
+    with pytest.raises(PdfInputError, match="not intact or the document was changed"):
         sign(resaved, identity, [sig()])
 
 

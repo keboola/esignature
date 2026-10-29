@@ -14,11 +14,13 @@ import httpx
 import pymupdf
 import pytest
 from fastapi.testclient import TestClient
+from pyhanko.sign.fields import MDPPerm
 from starlette.formparsers import MultiPartParser
 
 import server
 from config import Settings
 from tests.conftest import assert_all_signatures_ok, make_identity, make_pdf
+from tests.signed_fixtures import sign_as
 
 BASE = "http://127.0.0.1:8501"
 ORIGIN = BASE
@@ -205,6 +207,50 @@ def test_placement_limit_comes_from_config_not_the_client(client, identity):
                            **sign_form(identity, placements=placements))
     assert response.status_code == 400
     assert "maximum is 5" in response.json()["error"]
+
+
+# --- Counter-signing: structured error codes and the existing-signature limit (S8, K15) ----------
+
+def test_signed_document_with_protocol_returns_the_signed_document_code(client, identity):
+    signed = sign_as(make_pdf(), make_identity(common_name="Alice Original"))
+    response = client.post("/api/sign", headers=auth(client),
+                           **sign_form(identity, pdf=signed, protocol="true"))
+    assert response.status_code == 400
+    assert response.json()["code"] == "signed_document"
+    assert "already signed" in response.json()["error"]
+
+    response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=signed))
+    assert response.status_code == 200, response.text
+    assert response.content.startswith(signed)
+
+
+def test_locked_document_returns_the_locked_code(client, identity):
+    certified = sign_as(make_pdf(), make_identity(common_name="Alice Original"), certify=MDPPerm.NO_CHANGES)
+    response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=certified))
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "The document was certified or locked by a previous signer and does not allow new "
+                 "signatures.",
+        "code": "locked_document",
+    }
+
+
+def test_errors_without_a_reason_code_have_no_code_field(client, identity):
+    response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=b"not a pdf"))
+    assert response.status_code == 400
+    assert "code" not in response.json()
+
+
+@pytest.mark.parametrize("limit, status", [(1, 400), (2, 200)])
+def test_existing_signature_limit_comes_from_config(identity, limit, status):
+    party_a = make_identity(common_name="Alice Original")
+    once = sign_as(make_pdf(), party_a, field_name="A1", box=None)
+    twice = sign_as(once, party_a, field_name="A2", box=None)
+    with TestClient(make_app(replace(SETTINGS, max_existing_signatures=limit)), base_url=BASE) as client:
+        response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=twice))
+    assert response.status_code == status, response.text
+    if status == 400:
+        assert "already has 2 signatures; at most 1" in response.json()["error"]
 
 
 def test_signer_name_comes_from_the_certificate(client, identity):

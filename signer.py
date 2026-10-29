@@ -1,15 +1,20 @@
 """PDF signing functionality using pyhanko with visual signatures.
 
-Signing order (keeps every signature valid):
+Every full signature is a NEW signature field added in its own incremental revision; the field's
+widget appearance is the signature mark (imported as a form XObject and counter-rotated for the
+page /Rotate). Signatures are never drawn into page content.
 
-1. Open the PDF once, draw ALL visible marks (signatures and initials) into page contents and
-   append the optional protocol page(s), then save once. Nothing is signed yet, so a full save is fine.
-2. Add the cryptographic signatures, each as a pyhanko incremental update with a signature field
-   whose widget rectangle covers its drawn mark and has no appearance of its own (the mark is
-   page content). No full save happens after the first signature.
+Unsigned input:
+1. Open the PDF once (MuPDF may repair it), draw the initials into page contents and append the
+   optional protocol page(s), then save once. Nothing is signed yet, so a full save is fine.
+2. Add the signatures incrementally. No full save happens after the first signature.
+   If only initials are placed, one invisible signature is added so the document is still signed.
 
-Initials are visual marks covered by the document signature(s). If only initials are placed, one
-invisible signature is added so the document is still signed.
+Signed input (counter-signing):
+- Classification runs on the ORIGINAL bytes before any serialisation (see _classify_input).
+- The original bytes are never re-serialised; initials and the protocol page are refused.
+- Existing signatures are checked before signing (_check_existing_signatures) and re-validated in
+  the output (_post_check); the output must start with the original bytes.
 
 Placements follow the contract documented in :mod:`geometry`.
 """
@@ -19,20 +24,24 @@ import logging
 import re
 import traceback
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pymupdf
 from cryptography.hazmat.primitives.serialization import pkcs12
-from pyhanko.pdf_utils import generic
+from pyhanko.pdf_utils import content, generic, layout
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.misc import PdfError
 from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.sign import fields, signers
 from pyhanko.sign.fields import FieldMDPAction, FieldMDPSpec, MDPPerm
 from pyhanko.sign.signers.pdf_signer import PdfSignatureMetadata
-from pyhanko.stamp import NoOpStampStyle
+from pyhanko.sign.validation import validate_pdf_signature, validate_pdf_timestamp
+from pyhanko.sign.validation.pdf_embedded import read_certification_data
+from pyhanko.stamp import NoOpStampStyle, StaticStampStyle
+from pyhanko_certvalidator import ValidationContext
 
 from geometry import (
     BOX_SIZES,
@@ -84,7 +93,15 @@ class CertificateValidationError(SigningError):
 
 
 class PdfInputError(SigningError):
-    """Raised when the input PDF is not accepted for signing."""
+    """Raised when the input PDF is not accepted for signing.
+
+    ``code`` is an optional machine-readable reason for the API (``signed_document``,
+    ``locked_document``, ``invalid_existing_signatures``).
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def load_signer_from_p12(
@@ -441,34 +458,38 @@ def _build_initials_mark(signer_name: str) -> pymupdf.Document:
     return mark_doc
 
 
-def _draw_marks(
+def _draw_initials(
     doc: pymupdf.Document,
     placements: Sequence[Placement],
     signer_name: str,
-    signed_at: datetime,
-) -> List[Tuple[int, Tuple[float, float, float, float]]]:
-    """Draw every placement into page contents.
-
-    Returns:
-        (page index, raw PDF rect) for each signature placement, in order, for the signature fields.
-    """
-    marks = {
-        PLACEMENT_SIGNATURE: _build_signature_mark(signer_name, signed_at),
-        PLACEMENT_INITIALS: _build_initials_mark(signer_name),
-    }
-    signature_boxes = []
+) -> None:
+    """Draw every initials placement into page contents (unsigned input only)."""
+    initials = [p for p in placements if p.type == PLACEMENT_INITIALS]
+    if not initials:
+        return
+    mark = _build_initials_mark(signer_name)
     try:
-        for placement in placements:
+        for placement in initials:
             page = doc[placement.page]
             geometry = convert_displayed_rect(page, placement.displayed_rect)
             with unrotated_page(page) as rotation:
-                page.show_pdf_page(geometry.unrotated_rect, marks[placement.type], 0, rotate=rotation)
-            if placement.type == PLACEMENT_SIGNATURE:
-                signature_boxes.append((placement.page, geometry.pdf_rect))
+                page.show_pdf_page(geometry.unrotated_rect, mark, 0, rotate=rotation)
     finally:
-        for mark_doc in marks.values():
-            mark_doc.close()
-    return signature_boxes
+        mark.close()
+
+
+def _signature_boxes(doc: pymupdf.Document, placements: Sequence[Placement]) -> List["SignatureBox"]:
+    """Raw widget rectangle and page rotation for each signature placement, in order.
+
+    ``doc`` is only read (its page rotation is changed temporarily by the conversion and restored).
+    """
+    boxes = []
+    for placement in placements:
+        if placement.type != PLACEMENT_SIGNATURE:
+            continue
+        geometry = convert_displayed_rect(doc[placement.page], placement.displayed_rect)
+        boxes.append(SignatureBox(placement.page, geometry.pdf_rect, geometry.rotation))
+    return boxes
 
 
 # --- Protocol page ---------------------------------------------------------------------------
@@ -610,10 +631,40 @@ def _append_protocol_pages(
             y += 14
 
 
-# --- Input policy and signing ----------------------------------------------------------------
+# --- Input policy -------------------------------------------------------------------------------
 
 # Guard against cyclic or absurdly deep AcroForm trees.
 MAX_FIELD_TREE_DEPTH = 64
+
+# Default upper bound for existing signatures validated before counter-signing (config overrides it).
+DEFAULT_MAX_EXISTING_SIGNATURES = 20
+
+# Machine-readable error codes for the API (see PdfInputError.code).
+CODE_SIGNED_DOCUMENT = "signed_document"
+CODE_LOCKED_DOCUMENT = "locked_document"
+CODE_INVALID_EXISTING = "invalid_existing_signatures"
+
+MSG_SIGNED_EXTRAS = (
+    "This document is already signed. Initials and the protocol page cannot be added without "
+    "breaking the existing signatures."
+)
+MSG_DAMAGED_SIGNED = (
+    "This signed PDF is damaged and cannot be counter-signed without breaking the existing signatures."
+)
+MSG_UNSUPPORTED_SIGNATURE = (
+    "This PDF contains a signature that cannot be checked (unsupported or unreadable format), "
+    "so it cannot be counter-signed safely."
+)
+MSG_INVALID_EXISTING = (
+    "The existing signatures are not intact or the document was changed after signing."
+)
+MSG_LOCKED = (
+    "The document was certified or locked by a previous signer and does not allow new signatures."
+)
+MSG_BROKE_EXISTING = "Could not add a signature without breaking the existing signatures."
+MSG_MALFORMED_FIELDS = (
+    "The PDF has malformed form fields and cannot be signed. Re-save it with another PDF tool and try again."
+)
 
 
 def _deref(value: Any) -> Any:
@@ -621,37 +672,42 @@ def _deref(value: Any) -> Any:
     return value.get_object() if isinstance(value, generic.IndirectObject) else value
 
 
-def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
+def _acroform_field_names(reader: Any) -> Set[str]:
     """All fully qualified field names in the AcroForm tree plus every parent prefix.
 
     Fields without widgets and inline field dictionaries are included, so a generated name never
     collides with an existing field or with the parent of one (e.g. "Signature_1.child").
+
+    The tree must be traversable completely (fail closed): inline field entries, a /Kids or /Fields
+    value that is not an array, or nesting deeper than MAX_FIELD_TREE_DEPTH raise PdfInputError,
+    because an incomplete walk could miss a signature or a name.
     """
     names: Set[str] = set()
     acroform = _deref(reader.root.get("/AcroForm"))
-    if not isinstance(acroform, generic.DictionaryObject):
+    if acroform is None or isinstance(acroform, generic.NullObject):
         return names
+    if not isinstance(acroform, generic.DictionaryObject):
+        raise PdfInputError(MSG_MALFORMED_FIELDS)
     seen: Set[Tuple[int, int]] = set()
 
     def walk(items: Any, prefix: str, depth: int) -> None:
         items = _deref(items)
-        if depth > MAX_FIELD_TREE_DEPTH or not isinstance(items, generic.ArrayObject):
+        if items is None or isinstance(items, generic.NullObject):
             return
+        if depth > MAX_FIELD_TREE_DEPTH or not isinstance(items, generic.ArrayObject):
+            raise PdfInputError(MSG_MALFORMED_FIELDS)
         for item in items:
             if not isinstance(item, generic.IndirectObject):
                 # Field entries must be indirect references (PDF 32000 12.7.3); pyhanko cannot
                 # safely add a field next to inline ones.
-                raise PdfInputError(
-                    "The PDF has malformed form fields and cannot be signed. "
-                    "Re-save it with another PDF tool and try again."
-                )
+                raise PdfInputError(MSG_MALFORMED_FIELDS)
             key = (item.idnum, item.generation)
             if key in seen:
                 continue
             seen.add(key)
             field = item.get_object()
             if not isinstance(field, generic.DictionaryObject):
-                continue
+                continue  # a dangling or null entry is not a field
             partial = _deref(field.get("/T"))
             name = prefix
             if partial is not None:
@@ -666,40 +722,213 @@ def _acroform_field_names(reader: PdfFileReader) -> Set[str]:
     return names
 
 
-def _open_input_pdf(pdf_bytes: bytes) -> Tuple[pymupdf.Document, Set[str]]:
-    """Open the input PDF, rejecting unreadable, encrypted and already-signed documents.
+def _open_input_document(pdf_bytes: bytes) -> pymupdf.Document:
+    """Open the input with PyMuPDF and reject unreadable and encrypted files.
 
-    MuPDF repairs damaged files (e.g. a wrong startxref) on open; the signature and field checks
-    run on the repaired bytes, which is also what gets signed.
-
-    Returns:
-        (open document, names already used in the AcroForm field tree)
+    The document is only read here; it is serialised later only for unsigned input.
     """
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     except RuntimeError as e:  # pymupdf.FileDataError / EmptyFileError
         raise PdfInputError("The file is not a readable PDF.") from e
-
     try:
         encrypt_kind, _ = doc.xref_get_key(-1, "Encrypt")
         if doc.needs_pass or doc.is_encrypted or encrypt_kind not in ("null", "undefined"):
             raise PdfInputError(
                 "The PDF is encrypted or password-protected. Remove the protection and try again."
             )
-        try:
-            reader = PdfFileReader(io.BytesIO(doc.tobytes()), strict=False)
-            already_signed = bool(reader.embedded_signatures)
-            taken_names = _acroform_field_names(reader)
-        except PdfError as e:
-            raise PdfInputError("The file is not a readable PDF.") from e
-        if already_signed:
-            raise PdfInputError(
-                "The PDF is already signed. Adding signatures to signed documents is not supported."
-            )
     except BaseException:
         doc.close()
         raise
-    return doc, taken_names
+    return doc
+
+
+def _has_signature_objects(doc: pymupdf.Document) -> bool:
+    """True if any object looks like a signature value (/ByteRange) or a filled /Sig field.
+
+    Used as a fail-closed fallback when pyHanko cannot parse the original bytes, and as a cross
+    check when it can: MuPDF also finds objects that are no longer reachable from the form.
+    """
+    for xref in range(1, doc.xref_length()):
+        try:
+            kind, _ = doc.xref_get_key(xref, "ByteRange")
+            if kind not in ("null", "undefined"):
+                return True
+            ft_kind, ft = doc.xref_get_key(xref, "FT")
+            if ft_kind == "name" and ft == "/Sig":
+                v_kind, _ = doc.xref_get_key(xref, "V")
+                if v_kind not in ("null", "undefined"):
+                    return True
+        except Exception:  # noqa: BLE001 - MuPDF raises its own error types for free/broken objects
+            continue  # an unreadable object is not a signature MuPDF can see
+    return False
+
+
+@dataclass(frozen=True)
+class InputClassification:
+    """Whether the original bytes are signed, plus pyHanko's reader of them when it could parse them."""
+
+    signed: bool
+    reader: Optional[PdfFileReader]
+
+
+def _filled_signature_names(handler: Any) -> Set[str]:
+    return {name for name, _, _ in fields.enumerate_sig_fields(handler, filled_status=True)}
+
+
+def _historical_signature_names(reader: PdfFileReader) -> Set[str]:
+    """Names of filled signature fields in every earlier revision (removed fields included)."""
+    names: Set[str] = set()
+    for revision in range(reader.total_revisions - 1):
+        names |= _filled_signature_names(reader.get_historical_resolver(revision))
+    return names
+
+
+def _classify_input(original: bytes, doc: pymupdf.Document) -> InputClassification:
+    """Decide signed vs unsigned on the ORIGINAL bytes, before any PyMuPDF serialisation.
+
+    - pyHanko (strict=False, so hybrid-reference files parse) finds a filled signature field in
+      the current or any earlier revision (document timestamps and unsupported /SubFilter values
+      included), or MuPDF sees signature objects -> signed;
+    - pyHanko cannot parse the file at all: signed (and rejected as damaged) if MuPDF finds any
+      signature object, otherwise unsigned so MuPDF may repair it as before;
+    - a form tree that cannot be traversed completely -> rejected.
+    """
+    mupdf_sees_signatures = _has_signature_objects(doc)
+    try:
+        reader = PdfFileReader(io.BytesIO(original), strict=False)
+        reader.root  # noqa: B018 - force the trailer and catalog to be read
+    except Exception as e:  # noqa: BLE001 - any parse failure means "could not parse"
+        if mupdf_sees_signatures:
+            raise PdfInputError(MSG_DAMAGED_SIGNED, code=CODE_INVALID_EXISTING) from e
+        return InputClassification(signed=False, reader=None)
+
+    try:
+        _acroform_field_names(reader)
+        signed = bool(_filled_signature_names(reader)) or bool(_historical_signature_names(reader))
+    except PdfInputError:
+        raise
+    except Exception as e:  # noqa: BLE001 - a tree pyHanko cannot walk is not proof of "unsigned"
+        raise PdfInputError(MSG_MALFORMED_FIELDS, code=CODE_INVALID_EXISTING
+                            if mupdf_sees_signatures else None) from e
+    return InputClassification(signed=signed or mupdf_sees_signatures, reader=reader)
+
+
+# --- Existing signatures (signed input) ------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExistingSignature:
+    """Identity of an original signature: its field name and the bytes it covers."""
+
+    name: str
+    byte_range: Tuple[int, ...]
+
+
+def _byte_range(sig: Any) -> Tuple[int, ...]:
+    return tuple(int(v) for v in sig.sig_object["/ByteRange"])
+
+
+def _signature_preserved(sig: Any) -> bool:
+    """True if ``sig`` is intact, cryptographically valid and its later changes are permitted.
+
+    Uses pyHanko's DEFAULT diff policy. Trust is deliberately not required: a counter-signer
+    cannot make a stranger's certificate trusted, only keep the signature unbroken.
+    Validation errors propagate; callers decide how to fail closed.
+    """
+    context = ValidationContext(trust_roots=[], allow_fetching=False)
+    if sig.sig_object_type == "/DocTimeStamp":
+        status = validate_pdf_timestamp(sig, context)
+    else:
+        status = validate_pdf_signature(sig, context)
+    docmdp_ok = sig.summarise_integrity_info()["docmdp_ok"]
+    return bool(status.intact and status.valid and docmdp_ok)
+
+
+def _check_existing_signatures(
+    reader: PdfFileReader,
+    new_names: Sequence[str],
+    max_existing: int,
+) -> List[ExistingSignature]:
+    """Pre-check for counter-signing (S5): reject anything that new signatures could break.
+
+    Returns:
+        The identity of every original signature, for the post-check.
+    """
+    filled = list(fields.enumerate_sig_fields(reader, filled_status=True))
+    if len(filled) > max_existing:
+        raise PdfInputError(
+            f"The document already has {len(filled)} signatures; at most {max_existing} existing "
+            "signatures can be checked before counter-signing."
+        )
+    current = {name for name, _, _ in filled}
+    if _historical_signature_names(reader) - current:
+        # A signature field present in an earlier revision was removed later.
+        raise PdfInputError(MSG_INVALID_EXISTING, code=CODE_INVALID_EXISTING)
+    embedded = reader.embedded_signatures
+    if not filled or len(embedded) != len(filled):
+        # pyHanko skips signatures with an unsupported /SubFilter; MuPDF-only finds land here too.
+        raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING)
+
+    if read_certification_data(reader) is not None:
+        raise PdfInputError(MSG_LOCKED, code=CODE_LOCKED_DOCUMENT)
+    for sig in embedded:
+        # docmdp_level covers certification references and approval /Lock /P alike.
+        if sig.docmdp_level is not None:
+            raise PdfInputError(MSG_LOCKED, code=CODE_LOCKED_DOCUMENT)
+        if sig.fieldmdp is not None and any(sig.fieldmdp.is_locked(name) for name in new_names):
+            raise PdfInputError(MSG_LOCKED, code=CODE_LOCKED_DOCUMENT)
+
+    identities = []
+    for sig in embedded:
+        try:
+            preserved = _signature_preserved(sig)
+        except Exception as e:  # noqa: BLE001 - an unverifiable signature must not be risked
+            logger.warning("Existing signature could not be validated: %s", type(e).__name__)
+            raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING) from e
+        if not preserved:
+            raise PdfInputError(MSG_INVALID_EXISTING, code=CODE_INVALID_EXISTING)
+        identities.append(ExistingSignature(sig.field_name, _byte_range(sig)))
+    return identities
+
+
+def _post_check(
+    output: bytes,
+    original: bytes,
+    existing: Sequence[ExistingSignature],
+    new_names: Sequence[str],
+) -> None:
+    """Post-check for counter-signing (S6), fail closed: every original signature (same field,
+    same signed bytes) and every new one must still be preserved, and the original bytes must be
+    an unchanged prefix of the output."""
+    if not output.startswith(original):
+        raise SigningError(MSG_BROKE_EXISTING)
+    try:
+        reader = PdfFileReader(io.BytesIO(output), strict=False)
+        by_name = {sig.field_name: sig for sig in reader.embedded_signatures}
+        for identity in existing:
+            sig = by_name.get(identity.name)
+            if sig is None or _byte_range(sig) != identity.byte_range or not _signature_preserved(sig):
+                raise SigningError(MSG_BROKE_EXISTING)
+        for name in new_names:
+            sig = by_name.get(name)
+            if sig is None or not _signature_preserved(sig):
+                raise SigningError(MSG_BROKE_EXISTING)
+    except SigningError:
+        raise
+    except Exception as e:  # noqa: BLE001 - a check that cannot run is a failed check
+        logger.warning("Post-signing validation failed: %s", type(e).__name__)
+        raise SigningError(MSG_BROKE_EXISTING) from e
+
+
+# --- Signing ----------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SignatureBox:
+    """Where one signature goes: page index, raw widget /Rect (None = invisible) and page /Rotate."""
+
+    page: int
+    rect: Optional[Tuple[float, float, float, float]]
+    rotation: int
 
 
 def _signature_field_names(count: int, taken: Set[str]) -> List[str]:
@@ -714,17 +943,63 @@ def _signature_field_names(count: int, taken: Set[str]) -> List[str]:
     return names
 
 
+def _fmt(value: float) -> str:
+    return f"{value:g}"
+
+
+def _appearance_style(writer: IncrementalPdfFileWriter, mark_pdf: bytes, rotation: int) -> StaticStampStyle:
+    """Widget appearance: the upright mark, counter-rotated for the page /Rotate (S1).
+
+    The mark page is imported as a form XObject into THIS writer (resources are writer-bound, so
+    every incremental revision builds its own). The transform rotates the artwork
+    counter-clockwise in PDF space by the page rotation, so viewers show it upright; the
+    appearance box is the raw widget size (width and height swap at 90 and 270 degrees).
+    """
+    width, height = BOX_SIZES[PLACEMENT_SIGNATURE]
+    transforms = {
+        0: ("1 0 0 1 0 0", width, height),
+        90: (f"0 1 -1 0 {_fmt(height)} 0", height, width),
+        180: (f"-1 0 0 -1 {_fmt(width)} {_fmt(height)}", width, height),
+        270: (f"0 -1 1 0 0 {_fmt(width)}", height, width),
+    }
+    matrix, box_width, box_height = transforms[rotation % 360]
+    resources = content.PdfResources()
+    resources.xobject["/Mark"] = writer.import_page_as_xobject(
+        PdfFileReader(io.BytesIO(mark_pdf)), page_ix=0
+    )
+    background = content.RawContent(
+        f"q {matrix} cm /Mark Do Q".encode("ascii"),
+        resources=resources,
+        box=layout.BoxConstraints(width=box_width, height=box_height),
+    )
+    return StaticStampStyle(
+        background=background,
+        border_width=0,
+        background_opacity=1,
+        background_layout=layout.SimpleBoxLayoutRule(
+            x_align=layout.AxisAlignment.ALIGN_MIN,
+            y_align=layout.AxisAlignment.ALIGN_MIN,
+            margins=layout.Margins.uniform(0),
+            inner_content_scaling=layout.InnerScaling.NO_SCALING,
+        ),
+    )
+
+
 def _apply_signatures(
-    prepared_pdf: bytes,
+    base_pdf: bytes,
     signer: signers.SimpleSigner,
-    boxes: Sequence[Tuple[int, Optional[Tuple[float, float, float, float]]]],
+    boxes: Sequence[SignatureBox],
     names: Sequence[str],
+    mark_pdf: bytes,
     lock_after_signing: bool,
     reason: str,
 ) -> bytes:
-    """Add one incremental signature per box. The last one carries the lock when requested."""
-    current = prepared_pdf
-    for index, ((page_index, box), name) in enumerate(zip(boxes, names, strict=True)):
+    """Add one incremental signature per box; each new field's widget shows the mark (S1).
+
+    The last signature carries the lock when requested. Never rewrites earlier bytes.
+    """
+    current = base_pdf
+    for index, (box, name) in enumerate(zip(boxes, names, strict=True)):
         is_last = index == len(boxes) - 1
         writer = IncrementalPdfFileWriter(io.BytesIO(current), strict=False)
         existing = {fq_name for fq_name, _, _ in fields.enumerate_sig_fields(writer)}
@@ -744,21 +1019,26 @@ def _apply_signatures(
                 meta_kwargs = {"docmdp_permissions": MDPPerm.NO_CHANGES}
         field_spec = fields.SigFieldSpec(
             sig_field_name=name,
-            box=box,
-            on_page=page_index,
+            box=box.rect,
+            on_page=box.page,
             **lock_kwargs,
+        )
+        stamp_style = (
+            NoOpStampStyle() if box.rect is None else _appearance_style(writer, mark_pdf, box.rotation)
         )
         pdf_signer = signers.PdfSigner(
             signature_meta=PdfSignatureMetadata(
                 field_name=name, reason=reason, location='', **meta_kwargs
             ),
             signer=signer,
-            stamp_style=NoOpStampStyle(),
+            stamp_style=stamp_style,
             new_field_spec=field_spec,
         )
         out = io.BytesIO()
         pdf_signer.sign_pdf(writer, output=out)
         current = out.getvalue()
+        if not current.startswith(base_pdf):
+            raise SigningError("Could not add the signature incrementally.")
     return current
 
 
@@ -771,9 +1051,18 @@ def sign_pdf_multiple(
     add_protocol_page: bool = False,
     reason: str = "Electronically signed",
     max_placements: int = DEFAULT_MAX_PLACEMENTS,
+    max_existing_signatures: int = DEFAULT_MAX_EXISTING_SIGNATURES,
 ) -> bytes:
     """
     Sign a PDF document with visible signatures and initials.
+
+    Unsigned input: MuPDF may repair it; initials and the protocol page are drawn into page
+    content with one full save; then every signature is added incrementally.
+
+    Signed input (counter-signing): the original bytes are never re-serialised. Existing
+    signatures are checked first (S5), new signatures are appended incrementally, and every
+    original signature is re-validated in the output (S6). Initials and the protocol page are
+    refused (they would change signed page content).
 
     Args:
         pdf_bytes: PDF document to sign as bytes (not modified)
@@ -788,13 +1077,15 @@ def sign_pdf_multiple(
         add_protocol_page: Whether to append protocol page(s)
         reason: Reason for signing
         max_placements: Upper bound for the number of placements
+        max_existing_signatures: Upper bound for signatures already in the document
 
     Returns:
         Signed PDF as bytes
 
     Raises:
         CertificateValidationError, PdfInputError, PlacementError, SigningError: All with
-            user-safe messages that never contain the password.
+            user-safe messages that never contain the password. PdfInputError may carry a
+            machine-readable ``code`` (CODE_*).
     """
     try:
         signer = load_signer_from_p12(p12_bytes, p12_password)
@@ -802,24 +1093,49 @@ def sign_pdf_multiple(
         signer_name = sanitize_signer_name(get_signer_name_from_signer(signer))
         cert_info = get_certificate_info(signer)
         signed_at = datetime.now(timezone.utc)
+        original = bytes(pdf_bytes)
 
-        doc, taken_names = _open_input_pdf(pdf_bytes)
+        doc = _open_input_document(original)
         try:
+            classification = _classify_input(original, doc)
             placements = validate_placements(doc, signatures, max_placements)
-            boxes: List[Tuple[int, Optional[Tuple[float, float, float, float]]]]
-            boxes = list(_draw_marks(doc, placements, signer_name, signed_at))
-            if not boxes:
-                # Initials only: one invisible document signature.
-                boxes = [(0, None)]
-            names = _signature_field_names(len(boxes), taken_names)
-            if add_protocol_page:
-                _append_protocol_pages(doc, placements, signer_name, cert_info, signed_at)
-            # The only full save: nothing is signed yet.
-            prepared = doc.tobytes()
+            boxes = _signature_boxes(doc, placements)
+            if classification.signed:
+                assert classification.reader is not None
+                names = _signature_field_names(len(boxes), _acroform_field_names(classification.reader))
+                existing = _check_existing_signatures(
+                    classification.reader, names, max_existing_signatures
+                )
+                if add_protocol_page or len(boxes) != len(placements):
+                    raise PdfInputError(MSG_SIGNED_EXTRAS, code=CODE_SIGNED_DOCUMENT)
+                base = original  # no save of any kind in signed mode
+            else:
+                _draw_initials(doc, placements, signer_name)
+                if not boxes:
+                    # Initials only: one invisible document signature.
+                    boxes = [SignatureBox(page=0, rect=None, rotation=0)]
+                if add_protocol_page:
+                    _append_protocol_pages(doc, placements, signer_name, cert_info, signed_at)
+                # The only full save: nothing is signed yet.
+                base = doc.tobytes()
+                try:
+                    taken = _acroform_field_names(PdfFileReader(io.BytesIO(base), strict=False))
+                except PdfError as e:
+                    raise PdfInputError("The file is not a readable PDF.") from e
+                names = _signature_field_names(len(boxes), taken)
         finally:
             doc.close()
 
-        return _apply_signatures(prepared, signer, boxes, names, lock_after_signing, reason)
+        mark_doc = _build_signature_mark(signer_name, signed_at)
+        try:
+            mark_pdf = mark_doc.tobytes()  # the separate mark document, never the input
+        finally:
+            mark_doc.close()
+
+        output = _apply_signatures(base, signer, boxes, names, mark_pdf, lock_after_signing, reason)
+        if classification.signed:
+            _post_check(output, original, existing, names)
+        return output
 
     except (SigningError, PlacementError):
         raise
