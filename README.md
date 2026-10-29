@@ -24,6 +24,8 @@ and initials on the pages, and a signer that adds cryptographically valid PDF si
 - **Protocol page** – optional summary page with certificate and signature details.
 - **Lock after signing** – the last signature requests that no further changes are made
   (enforcement depends on the PDF viewer).
+- **Counter-signing** – add your signature to a contract the other party already signed; their
+  signature stays valid (see [Counter-signing signed PDFs](#counter-signing-signed-pdfs)).
 
 ## Run it
 
@@ -51,6 +53,7 @@ app at startup with a message naming the variable.
 | `ESIGN_MAX_PLACEMENTS` | `1000` | Most signatures + initials in one signing |
 | `ESIGN_MAX_IN_FLIGHT` | `2` | Requests handled at once; more get "busy, try again" |
 | `ESIGN_BODY_TIMEOUT_S` | `30` | Seconds allowed to upload a request; slower uploads are cut off |
+| `ESIGN_MAX_EXISTING_SIGNATURES` | `20` | Most signatures a document may already have to be counter-signed (each one is validated before and after signing) |
 
 ## How to use
 
@@ -64,8 +67,47 @@ app at startup with a message naming the variable.
    The boxes show a preview; the real mark contains your name, the signing time and a link.
 5. **Sign** – click "Sign document", then "Download signed PDF".
 
-Encrypted PDFs, PDFs that already carry a signature, and pages with a /Rotate that is not a
-multiple of 90 degrees are rejected with a clear message.
+Encrypted PDFs and pages with a /Rotate that is not a multiple of 90 degrees are rejected with a
+clear message.
+
+## Counter-signing signed PDFs
+
+If the PDF is already signed (for example a contract you received signed by the other party), you
+can add your own signature(s) and every earlier signature stays valid:
+
+1. Open the PDF and place your signature(s) as usual. If the document contains signature fields,
+   the editor says so (the browser cannot tell whether they are filled, so it does not block
+   anything yet).
+2. Click **Sign**. The app checks the document. If it is already signed, the editor switches to
+   *signed mode*: the protocol page and initials are switched off, your placements are kept, and
+   you click **Sign** again to add your signature.
+3. Download the result. It is the original file byte for byte, with your signature(s) appended as
+   incremental updates.
+
+Why initials and the protocol page are not available: both change page content or add pages,
+which an existing signature does not allow. Your full signatures are added as new signature
+fields whose appearance is your mark, which approval signatures permit.
+
+Documents that cannot be counter-signed safely are refused with a specific message:
+
+- **Certified or locked** – certified documents (any DocMDP permission), approval signatures
+  with a `/Lock` permission, and signatures whose field lock (FieldMDP) covers new fields. Adding
+  a visible signature would be reported as a disallowed change by standard validators.
+- **Existing signatures not intact** – an earlier signature is already broken, the document was
+  changed after signing in a way the signature does not permit (page content, appearance,
+  rotation), or a signature field was removed.
+- **Signature that cannot be checked** – an unsupported signature format (`/SubFilter`).
+- **Damaged signed PDF** – a signed file that only parses after repair; repairing it would break
+  the signatures.
+- **Too many signatures** – more than `ESIGN_MAX_EXISTING_SIGNATURES`.
+
+Document timestamps are kept valid like signatures. After signing, the app re-validates every
+original signature and refuses to return a file in which any of them would be broken.
+
+Limits: the app checks that existing signatures are intact and unchanged, not that their
+certificates are trusted – that remains the reader's validator's job. Your new mark is opaque, so
+a placement that overlaps an existing signature is flagged with a warning; signing is still
+allowed.
 
 ## Security notes
 
@@ -96,7 +138,7 @@ Project layout:
 ```
 server.py      FastAPI app: security middleware, admission, API, static files, entry point
 config.py      Settings from environment variables
-signer.py      Signing (pyHanko + PyMuPDF): marks, protocol page, signatures, lock
+signer.py      Signing (pyHanko + PyMuPDF): marks, protocol page, signatures, lock, counter-signing checks
 geometry.py    Placement contract and page-space conversion
 static/        Frontend: index.html, app.css, js/ (ES modules), vendor/pdfjs/
 fonts/         Dancing Script (signature font, OFL)
@@ -109,7 +151,8 @@ A placement is `{page, type: "signature" | "initials", x, y}`: `page` is 0-based
 the top-left corner of the box in PDF points on the page **as displayed** (crop box, rotation
 applied, origin top-left), which is exactly PDF.js's viewport at scale 1. Box sizes are fixed:
 signature 150 × 50 pt, initials 50 × 35 pt. The server converts this once to PDF coordinates, for
-both the drawn mark and the signature field.
+both the initials drawn into the page and the signature field (whose widget appearance is the
+signature mark, counter-rotated for the page /Rotate so it is upright as displayed).
 
 ## License
 

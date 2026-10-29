@@ -471,6 +471,10 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # Validating existing signatures without trusting their certificates makes pyHanko log every
+    # untrusted chain with the signers' names; that is document content, which is not logged.
+    for name in ("pyhanko", "pyhanko_certvalidator"):
+        logging.getLogger(name).setLevel(logging.ERROR)
     try:
         settings = load_settings()
     except ConfigError as e:
