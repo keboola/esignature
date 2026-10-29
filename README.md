@@ -110,8 +110,10 @@ Documents that cannot be counter-signed safely are refused with a specific messa
   changed after signing in a way the signature does not permit (page content, appearance,
   rotation), or a signature was removed or replaced by another one under the same field name.
 - **Signature that cannot be checked** – an unsupported signature format (`/SubFilter`).
-- **Damaged signed PDF** – a file that only parses after repair and contains signature data in
-  any revision; repairing it would break the signatures.
+- **Damaged PDF that may contain signatures** – a file that only parses after repair is repaired
+  and signed only if its raw bytes show no sign of a signature (signature names, even written with
+  `#xx` escapes) and no compressed object streams, which could hide one. Otherwise repairing it
+  could break a signature, so it is refused; re-save it with another PDF tool first.
 - **Too many signatures or revisions** – more than `ESIGN_MAX_EXISTING_SIGNATURES` signatures, or
   more than `ESIGN_MAX_REVISIONS` revisions (this limit applies to every input, signed or not).
 

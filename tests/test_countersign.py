@@ -7,6 +7,8 @@ with the original bytes.
 """
 
 import io
+import shutil
+import subprocess
 import time
 
 import pymupdf
@@ -33,6 +35,7 @@ from tests.signed_fixtures import (
     broken_startxref,
     corrupt_signature_contents,
     edit_page_content_after,
+    escaped_signature_names,
     hide_signature_history,
     hybrid_xref_pdf,
     remove_field_after,
@@ -209,9 +212,13 @@ def test_timestamp_only_document_counts_as_signed(party_b, tsa):
 
 # --- K5/K6/K7: damaged, hybrid and malformed inputs ------------------------------------------------------
 
+DAMAGED = ("This PDF is damaged and may contain signatures; it cannot be signed safely. "
+           "Re-save it with another PDF tool first.")
+
+
 def test_signed_pdf_with_broken_startxref_is_refused_as_damaged(party_b, signed_by_a):
     error = assert_rejected(broken_startxref(signed_by_a), party_b, CODE_INVALID_EXISTING, "damaged")
-    assert "cannot be counter-signed" in str(error)
+    assert str(error) == DAMAGED
 
 
 def test_hybrid_xref_signed_document_is_countersigned(party_a, party_b):
@@ -245,7 +252,7 @@ def test_field_tree_pyhanko_cannot_walk_is_never_treated_as_unsigned(party_b, mo
     def broken(_handler):
         raise RecursionError("cyclic tree")
 
-    monkeypatch.setattr(signer_module, "_filled_signature_names", broken)
+    monkeypatch.setattr(signer_module, "_signed_in_any_revision", broken)
     with pytest.raises(PdfInputError, match="malformed form fields"):
         countersign(make_pdf(), party_b)
 
@@ -445,13 +452,17 @@ def test_hidden_signed_history_with_broken_startxref_is_never_repaired(party_a, 
 
 
 @pytest.mark.parametrize("marker", [
-    b"/ByteRange [0 1 2 3]", b"/Type/Sig ", b"/Type \n /Sig>>", b"/SubFilter /x", b"/DocTimeStamp",
+    b"/ByteRange [0 1 2 3]", b"/Type/Sig ", b"/Type/Sig>>", b"/Type \n /Sig>>", b"/SubFilter /x",
+    b"/DocTimeStamp", b"/#42yteRange [0 1 2 3]", b"/#54ype /#53ig", b"/Sub#46ilter /x",
+    b"/Type /ObjStm", b"/Type /Obj#53tm",
 ])
 def test_any_raw_signature_marker_in_an_unparsable_file_blocks_repair(party_b, marker):
+    """Name escapes are decoded before the scan; object streams could hide markers."""
     pdf = make_pdf()
     tail = pdf.rfind(b"startxref")
     planted = pdf[:tail] + b"99 0 obj\n<< " + marker + b" >>\nendobj\n" + pdf[tail:]
-    assert_rejected(broken_startxref(planted), party_b, CODE_INVALID_EXISTING, "damaged")
+    error = assert_rejected(broken_startxref(planted), party_b, CODE_INVALID_EXISTING, "damaged")
+    assert str(error) == DAMAGED
 
 
 def test_unparsable_file_without_signature_markers_is_still_repaired(party_b):
@@ -476,12 +487,75 @@ def test_revision_limit_is_a_parameter(party_b):
     countersign(five, party_b, max_revisions=5)
 
 
-def test_unsigned_input_never_walks_the_signature_history(party_b, monkeypatch):
-    def forbidden(_reader):
-        raise AssertionError("history walked for unsigned input")
+def test_unsigned_hundred_revision_file_signs_quickly(party_b):
+    """Every parsable input has its history walked; the revision cap keeps that cheap."""
+    hundred = with_revisions(make_pdf(), signer_module.DEFAULT_MAX_REVISIONS - 1)
+    started = time.monotonic()
+    out = countersign(hundred, party_b)
+    elapsed = time.monotonic() - started
+    print(f"unsigned {signer_module.DEFAULT_MAX_REVISIONS}-revision file signed in {elapsed:.2f} s")
+    assert elapsed < 2
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
 
-    monkeypatch.setattr(signer_module, "_historical_signature_identities", forbidden)
-    out = countersign(with_revisions(make_pdf(), 20), party_b)
+
+# --- Fix round 2: classification without raw-byte scanning for parsable files -------------------------
+
+@pytest.fixture(scope="module")
+def escaped_signed(party_a):
+    with escaped_signature_names():
+        signed = sign_as(make_pdf(), party_a)
+    assert b"/#42yteRange" in signed and b"/ByteRange" not in signed
+    return signed
+
+
+def test_escaped_names_signed_original_is_countersigned_as_signed(party_a, party_b, escaped_signed):
+    out = countersign(escaped_signed, party_b)
+    assert out.startswith(escaped_signed)
+    assert_every_signature_ok(out, roots(party_a, party_b), ["A", "Signature_1"])
+    assert_rejected(escaped_signed, party_b, CODE_SIGNED_DOCUMENT, "already signed",
+                    [sig()], add_protocol_page=True)
+
+
+def test_escaped_names_hidden_history_is_refused(party_b, escaped_signed):
+    hidden = remove_field_after(escaped_signed)
+    assert_rejected(hidden, party_b, CODE_INVALID_EXISTING, "not intact or the document was changed")
+
+
+def test_escaped_names_signed_original_with_broken_startxref_is_refused(party_b, escaped_signed):
+    error = assert_rejected(broken_startxref(escaped_signed), party_b, CODE_INVALID_EXISTING, "damaged")
+    assert str(error) == DAMAGED
+
+
+def test_byterange_in_metadata_of_an_unsigned_pdf_is_not_a_signature(party_b):
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.set_metadata({"subject": "Example /ByteRange for a PDF training manual"})
+    pdf = doc.tobytes()
+    assert b"/ByteRange" in pdf
+
+    out = countersign(pdf, party_b, add_protocol_page=True)
+
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+def test_seed_value_subfilter_with_broken_startxref_fails_closed(party_b):
+    """Accepted false refusal: an unparsable file that mentions /SubFilter cannot be repaired."""
+    error = assert_rejected(broken_startxref(seed_value_form()), party_b, CODE_INVALID_EXISTING, "damaged")
+    assert str(error) == DAMAGED
+
+
+def test_linearized_unsigned_pdf_signs(party_b, tmp_path):
+    qpdf = shutil.which("qpdf")
+    if qpdf is None:
+        pytest.skip("PyMuPDF 2.0 no longer linearizes and qpdf is not installed")
+    source, target = tmp_path / "in.pdf", tmp_path / "linear.pdf"
+    source.write_bytes(make_pdf(pages=3, text="Linearized"))
+    subprocess.run([qpdf, "--linearize", str(source), str(target)], check=True)
+    linear = target.read_bytes()
+    assert b"/Linearized" in linear[:1024]
+
+    out = countersign(linear, party_b, add_protocol_page=True)
+
     assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
 
 
@@ -515,15 +589,18 @@ def test_existing_signature_limit_carries_a_code(party_a, party_b):
     assert_rejected(three, party_b, CODE_TOO_MANY_SIGNATURES, "at most 2", max_existing_signatures=2)
 
 
-def test_unsigned_form_with_seed_value_subfilter_is_still_signed_normally(party_b):
-    """/SubFilter also appears in seed values of EMPTY fields; only an unparsable file treats it
-    as a signature marker."""
+def seed_value_form() -> bytes:
     doc = pymupdf.open()
     doc.new_page()
     field = doc.get_new_xref()
     doc.update_object(field, "<< /FT /Sig /T (Empty) /SV << /SubFilter [/adbe.pkcs7.detached] >> >>")
     doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{field} 0 R] >>")
+    return doc.tobytes()
 
-    out = countersign(doc.tobytes(), party_b, add_protocol_page=True)
+
+def test_unsigned_form_with_seed_value_subfilter_is_still_signed_normally(party_b):
+    """/SubFilter also appears in seed values of EMPTY fields; only an unparsable file treats it
+    as a signature marker."""
+    out = countersign(seed_value_form(), party_b, add_protocol_page=True)
 
     assert_every_signature_ok(out, roots(party_b), ["Signature_1"])

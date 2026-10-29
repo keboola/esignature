@@ -5,6 +5,7 @@ tests then counter-sign as party B through ``sign_pdf_multiple``. Negative contr
 A's revision history the way a careless or malicious tool would.
 """
 
+import contextlib
 import datetime
 import io
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -99,6 +100,30 @@ class TestTsa:
         out = io.BytesIO()
         stamper.timestamp_pdf(writer, "sha256", ValidationContext(trust_roots=[self.asn1_cert]), output=out)
         return out.getvalue()
+
+
+# --- Legal name escapes ------------------------------------------------------------------------------
+
+ESCAPED_NAMES = {"/ByteRange", "/SubFilter", "/Type"}
+
+
+@contextlib.contextmanager
+def escaped_signature_names():
+    """While active, pyHanko writes /ByteRange, /SubFilter and /Type with a legal #xx escape on
+    their first letter (/#42yteRange ...). Readers decode these; byte scanners do not."""
+    original = generic.NameObject.write_to_stream
+
+    def write(self, stream, handler=None, container_ref=None):
+        if str(self) in ESCAPED_NAMES:
+            stream.write(b"/#%02X" % ord(str(self)[1]) + str(self)[2:].encode("ascii"))
+        else:
+            original(self, stream, handler, container_ref)
+
+    generic.NameObject.write_to_stream = write
+    try:
+        yield
+    finally:
+        generic.NameObject.write_to_stream = original
 
 
 # --- Damaged and unusual files ---------------------------------------------------------------------

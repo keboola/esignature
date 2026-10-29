@@ -654,7 +654,8 @@ MSG_SIGNED_EXTRAS = (
     "breaking the existing signatures."
 )
 MSG_DAMAGED_SIGNED = (
-    "This signed PDF is damaged and cannot be counter-signed without breaking the existing signatures."
+    "This PDF is damaged and may contain signatures; it cannot be signed safely. "
+    "Re-save it with another PDF tool first."
 )
 MSG_UNSUPPORTED_SIGNATURE = (
     "This PDF contains a signature that cannot be checked (unsupported or unreadable format), "
@@ -752,21 +753,21 @@ def _open_input_document(pdf_bytes: bytes) -> pymupdf.Document:
     return doc
 
 
-# Signature markers in raw bytes. Signature value dictionaries cannot live in compressed object
-# streams (their /ByteRange offsets point into the file), so a plain byte scan sees every
-# revision, including ones the current object graph no longer references.
-_RAW_SIGNATURE_MARKERS = re.compile(rb"/ByteRange|/SubFilter|/DocTimeStamp|/Type\s*/Sig(?![A-Za-z0-9])")
+# Fail-closed scan for files pyHanko cannot parse. Name escapes (/#42yteRange) are decoded first;
+# an object stream (/ObjStm) could hide any of the markers in compressed data, so it counts too.
+_NAME_ESCAPE = re.compile(rb"#([0-9A-Fa-f]{2})")
+_RAW_SIGNATURE_MARKERS = re.compile(
+    rb"/ByteRange|/SubFilter|/DocTimeStamp|/ObjStm|/Type\s*/Sig(?![A-Za-z0-9])")
 
 
-def _has_raw_signature_markers(original: bytes) -> bool:
-    """Any signature-related marker; used only when pyHanko cannot parse the file (fail closed)."""
-    return _RAW_SIGNATURE_MARKERS.search(original) is not None
+def _may_contain_signatures(original: bytes) -> bool:
+    """True if the raw bytes of an UNPARSABLE file could hold a signature in any revision.
 
-
-def _has_raw_signature_values(original: bytes) -> bool:
-    """A /ByteRange anywhere: a signature value in some revision. Used for parsable files, where
-    /SubFilter alone may just be a seed value of an empty field."""
-    return b"/ByteRange" in original
+    Only used when pyHanko cannot parse the file; false positives (a damaged file that merely
+    mentions these names) are accepted.
+    """
+    decoded = _NAME_ESCAPE.sub(lambda match: bytes([int(match.group(1), 16)]), original)
+    return _RAW_SIGNATURE_MARKERS.search(decoded) is not None
 
 
 @dataclass(frozen=True)
@@ -775,10 +776,6 @@ class InputClassification:
 
     signed: bool
     reader: Optional[PdfFileReader]
-
-
-def _filled_signature_names(handler: Any) -> Set[str]:
-    return {name for name, _, _ in fields.enumerate_sig_fields(handler, filled_status=True)}
 
 
 def _check_revision_count(reader: PdfFileReader, max_revisions: int) -> None:
@@ -791,36 +788,44 @@ def _check_revision_count(reader: PdfFileReader, max_revisions: int) -> None:
         )
 
 
+def _signed_in_any_revision(reader: PdfFileReader) -> bool:
+    """True if the current or any earlier revision has a filled signature field (signatures and
+    document timestamps, any /SubFilter). pyHanko decodes name escapes, object streams and hybrid
+    cross-reference sections, so nothing here depends on how the bytes are spelled."""
+    for revision in range(reader.total_revisions):
+        resolver = reader.get_historical_resolver(revision)
+        if any(True for _ in fields.enumerate_sig_fields(resolver, filled_status=True)):
+            return True
+    return False
+
+
 def _classify_input(original: bytes, max_revisions: int) -> InputClassification:
     """Decide signed vs unsigned on the ORIGINAL bytes, before any PyMuPDF serialisation.
 
-    - pyHanko (strict=False, so hybrid-reference files parse) finds a filled signature field
-      (document timestamps and unsupported /SubFilter values included), or the raw bytes of any
-      revision contain a signature value (/ByteRange) -> signed;
-    - pyHanko cannot parse the file at all: signed (and rejected as damaged) if the raw bytes
-      contain any signature marker; only a clean raw scan lets MuPDF repair it as unsigned;
-    - more revisions than ``max_revisions`` -> rejected before any per-revision work;
-    - a form tree that cannot be traversed completely -> rejected.
-    The (costly) history walk happens only for signed input, in _check_existing_signatures.
+    - Parsable by pyHanko (strict=False, so hybrid-reference files parse): first the revision cap
+      (bounds the work), then the signature history of EVERY revision -> signed if any revision
+      had a filled signature field. No raw-byte scanning.
+    - Not parsable: fail closed. Only a raw scan without signature markers (after decoding name
+      escapes, see _may_contain_signatures) lets MuPDF repair the file as unsigned.
+    - A form tree that cannot be traversed completely -> rejected.
     """
     try:
         reader = PdfFileReader(io.BytesIO(original), strict=False)
         reader.root  # noqa: B018 - force the trailer and catalog to be read
     except Exception as e:  # noqa: BLE001 - any parse failure means "could not parse"
-        if _has_raw_signature_markers(original):
+        if _may_contain_signatures(original):
             raise PdfInputError(MSG_DAMAGED_SIGNED, code=CODE_INVALID_EXISTING) from e
         return InputClassification(signed=False, reader=None)
-    raw_markers = _has_raw_signature_values(original)
 
     _check_revision_count(reader, max_revisions)
     try:
         _acroform_field_names(reader)
-        signed = bool(_filled_signature_names(reader))
+        signed = _signed_in_any_revision(reader)
     except PdfInputError:
         raise
     except Exception as e:  # noqa: BLE001 - a tree pyHanko cannot walk is not proof of "unsigned"
-        raise PdfInputError(MSG_MALFORMED_FIELDS, code=CODE_INVALID_EXISTING if raw_markers else None) from e
-    return InputClassification(signed=signed or raw_markers, reader=reader)
+        raise PdfInputError(MSG_MALFORMED_FIELDS) from e
+    return InputClassification(signed=signed, reader=reader)
 
 
 # --- Existing signatures (signed input) ------------------------------------------------------------
@@ -903,8 +908,7 @@ def _check_existing_signatures(
     if historical - current:
         # A signature from an earlier revision was removed or replaced under the same name.
         raise PdfInputError(MSG_INVALID_EXISTING, code=CODE_INVALID_EXISTING)
-    if not filled:
-        # Signature markers in the bytes, but no signature in any revision's form.
+    if not filled and not historical:
         raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING)
 
     if read_certification_data(reader) is not None:
