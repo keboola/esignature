@@ -161,6 +161,13 @@ button:disabled { opacity: 0.45; cursor: default; }
   font-size: calc(6px * var(--s)); line-height: 1.6; background: var(--accent); color: #fff;
   border-bottom-left-radius: 2px; letter-spacing: 0.02em; text-transform: uppercase;
 }
+/* Overlap with an existing signature widget: warn, but signing stays allowed. */
+.mark-overlap {
+  display: none; position: absolute; left: 0; right: 0; bottom: 0; padding: 0 calc(3px * var(--s));
+  font-size: calc(6px * var(--s)); line-height: 1.6; background: var(--warning); color: #fff;
+}
+.mark.overlap { border-color: var(--warning); }
+.mark.overlap .mark-overlap { display: block; }
 .mark-initials-text {
   height: 100%; display: flex; align-items: center; justify-content: center;
   font-weight: 600; font-size: calc(16px * var(--s));
@@ -196,6 +203,11 @@ button:disabled { opacity: 0.45; cursor: default; }
 .step p { margin: 8px 0 0; }
 .warning { color: var(--warning); }
 .error { color: var(--danger); }
+.notice {
+  margin: 8px 0; padding: 8px 10px; border-radius: var(--radius);
+  background: #fff6e5; border: 1px solid #f2d39b; color: #6b4300;
+}
+.step p.notice { margin: 8px 0 0; }
 
 .file-field {
   display: flex; align-items: center; gap: 10px; cursor: pointer; position: relative;

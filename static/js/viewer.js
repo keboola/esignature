@@ -16,6 +16,25 @@ const MAX_CANVAS_PIXELS = 16_000_000;
 export const MIN_SCALE = 0.25;
 export const MAX_SCALE = 4;
 
+/** Signature widget rectangles of a page in displayed space at scale 1 (points, top-left origin). */
+async function signatureWidgets(page, viewport) {
+  let annotations = [];
+  try {
+    annotations = await page.getAnnotations({ intent: "display" });
+  } catch {
+    return []; // a broken annotation list only loses the hint and the overlap warning
+  }
+  const result = [];
+  for (const annotation of annotations) {
+    if (annotation.fieldType !== "Sig" || !Array.isArray(annotation.rect)) continue;
+    const [x1, y1, x2, y2] = viewport.convertToViewportRectangle(annotation.rect);
+    const x = Math.min(x1, x2);
+    const y = Math.min(y1, y2);
+    result.push({ x, y, w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) });
+  }
+  return result;
+}
+
 export class Viewer {
   /**
    * @param {HTMLElement} scroller scrolling container
@@ -39,7 +58,11 @@ export class Viewer {
   }
 
   /**
-   * Opens a PDF; resolves to the page sizes in points as displayed. Replaces any open document.
+   * Opens a PDF; resolves to {sizes, signatureFields, signaturesHint}. Replaces any open document.
+   * - sizes: page sizes in points as displayed;
+   * - signatureFields: [{page, x, y, w, h}] rectangles of signature widgets in displayed space
+   *   (PDF.js cannot tell filled from empty fields, so these are fields, not signatures);
+   * - signaturesHint: the document's /SigFlags say signatures may be present (a hint only).
    * Generation-safe: a newer open() or close() supersedes this one, which then rejects with
    * "superseded" without touching the viewer.
    */
@@ -60,16 +83,20 @@ export class Viewer {
     try {
       const doc = await task.promise;
       const sizes = [];
+      const signatureFields = [];
       for (let i = 1; i <= doc.numPages && !superseded(); i += 1) {
         const page = await doc.getPage(i);
         const viewport = page.getViewport({ scale: 1 });
         sizes.push({ width: viewport.width, height: viewport.height });
+        for (const field of await signatureWidgets(page, viewport)) signatureFields.push({ page: i - 1, ...field });
       }
+      if (superseded()) throw new Error("superseded");
+      const metadata = await doc.getMetadata().catch(() => null);
       if (superseded()) throw new Error("superseded");
       this.doc = doc;
       this.sizes = sizes;
       this.#buildSlots();
-      return sizes;
+      return { sizes, signatureFields, signaturesHint: Boolean(metadata?.info?.IsSignaturesPresent) };
     } catch (error) {
       if (superseded()) {
         task.destroy();

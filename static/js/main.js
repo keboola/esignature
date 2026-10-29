@@ -29,6 +29,7 @@ const els = {
   pdfInput: $("pdf-input"),
   pdfName: $("pdf-name"),
   docInfo: $("doc-info"),
+  docNotice: $("doc-notice"),
   p12Input: $("p12-input"),
   p12Name: $("p12-name"),
   password: $("password"),
@@ -53,6 +54,7 @@ const els = {
   optLock: $("opt-lock"),
   sign: $("sign"),
   signHint: $("sign-hint"),
+  signNotice: $("sign-notice"),
   signError: $("sign-error"),
   download: $("download"),
 };
@@ -77,7 +79,17 @@ const app = {
   placing: false,
   resultUrl: null,
   drag: null,
+  // Per document; reset on every document change (see resetDocumentPolicy).
+  signatureFields: [], // [{page, x, y, w, h}] signature widgets from PDF.js, displayed space
+  signaturesHint: false, // the document seems to contain signature fields (heuristic only)
+  signedMode: false, // the server said this document is already signed: signatures only
+  blockedMessage: null, // the server refused this document (locked / invalid existing signatures)
 };
+
+const SIGNED_MODE_NOTICE = "This document is already signed. Your signature will be added; initials "
+  + "and the protocol page are not available. Click Sign again.";
+const SIGNATURE_FIELDS_NOTICE = "This document seems to contain signature fields. If it is already "
+  + "signed, initials and the protocol page are not available.";
 
 // --- Signed result -------------------------------------------------------------------------------
 
@@ -113,6 +125,25 @@ function resetInitials() {
 
 // --- Document ------------------------------------------------------------------------------------
 
+function resetDocumentPolicy() {
+  app.signatureFields = [];
+  app.signaturesHint = false;
+  app.signedMode = false;
+  app.blockedMessage = null;
+}
+
+/**
+ * The server is authoritative about signed documents (PDF.js cannot tell filled from empty
+ * signature fields). Signed mode: protocol unchecked and disabled, initials cleared and disabled
+ * (state AND controls), signature placements kept; the user must click Sign again.
+ */
+function enterSignedMode() {
+  app.signedMode = true;
+  els.optProtocol.checked = false;
+  resetInitials();
+  if (state.selected?.kind === "initials") state.selected = null;
+}
+
 async function openPdf(file) {
   if (!file) return;
   const seq = ++app.docSeq;
@@ -122,6 +153,7 @@ async function openPdf(file) {
   state.pageSizes = [];
   state.selected = null;
   resetInitials();
+  resetDocumentPolicy();
   setPlacing(false);
   viewer.close();
   els.pdfName.textContent = file.name;
@@ -133,10 +165,12 @@ async function openPdf(file) {
     const bytes = await file.arrayBuffer();
     if (seq !== app.docSeq) return; // a newer file was chosen meanwhile
     // PDF.js takes ownership of the buffer it gets, so it gets a copy.
-    const sizes = await viewer.open(bytes.slice(0));
+    const { sizes, signatureFields, signaturesHint } = await viewer.open(bytes.slice(0));
     if (seq !== app.docSeq) return;
     app.pdf = { name: file.name, bytes };
     state.pageSizes = sizes;
+    app.signatureFields = signatureFields;
+    app.signaturesHint = signaturesHint || signatureFields.length > 0;
     autoFit = true;
     viewer.setScale(viewer.fitWidthScale());
     els.docInfo.textContent = `${sizes.length} page${sizes.length === 1 ? "" : "s"}`;
@@ -398,6 +432,14 @@ document.addEventListener("keydown", (event) => {
 
 // --- Rendering -----------------------------------------------------------------------------------
 
+/** True if a signature box overlaps an existing signature widget on its page. */
+function overlapsExistingSignature(signature) {
+  const box = BOX.signature;
+  return app.signatureFields.some((field) => field.page === signature.page
+    && signature.x < field.x + field.w && field.x < signature.x + box.w
+    && signature.y < field.y + field.h && field.y < signature.y + box.h);
+}
+
 let marksFrame = 0;
 function scheduleMarks() {
   if (!marksFrame) {
@@ -425,7 +467,8 @@ function markElement(kind, page) {
   el.addEventListener("lostpointercapture", (event) => endDrag(event, false));
   if (kind === "signature") {
     for (const [cls, text] of [["mark-name", ""], ["mark-line", "Date and time at signing"],
-      ["mark-url", "github.com/keboola/esignature"], ["mark-tag", "Preview"]]) {
+      ["mark-url", "github.com/keboola/esignature"], ["mark-tag", "Preview"],
+      ["mark-overlap", "Overlaps an existing signature"]]) {
       const line = document.createElement("div");
       line.className = cls;
       line.textContent = text;
@@ -470,6 +513,7 @@ function renderMarks() {
     el.setAttribute("aria-label", `Signature ${index + 1} on page ${signature.page + 1}`);
     el.querySelector(".mark-name").textContent = app.cert ? app.cert.name : "Your name";
     el.classList.toggle("selected", selected?.kind === "signature" && selected.id === signature.id);
+    el.classList.toggle("overlap", overlapsExistingSignature(signature));
   });
   for (const inst of initialsInstances(state).instances) {
     const el = upsertMark(`i${inst.page}`, "initials", inst.page, inst.x, inst.y, seen);
@@ -546,7 +590,8 @@ function renderCertificate() {
 
 function renderInitials() {
   const hasDoc = state.pageSizes.length > 0;
-  els.initialsOn.disabled = !hasDoc;
+  // Signed mode keeps initials off: nothing here may re-enable them.
+  els.initialsOn.disabled = !hasDoc || app.signedMode;
   els.initialsOptions.hidden = !state.initials.enabled;
   els.initialsCustomField.hidden = state.initials.preset !== "custom";
   const { instances, misfit, error } = initialsInstances(state);
@@ -569,6 +614,7 @@ function signBlocker(initials) {
   if (!app.p12) return "Choose your P12 / PFX certificate.";
   if (app.certChecking) return "Checking the certificate…";
   if (!app.cert) return app.certError ? "Fix the certificate or password." : "Checking the certificate…";
+  if (app.blockedMessage) return `${app.blockedMessage} Choose another document to sign.`;
   // Say exactly what is wrong: the initials settings may be scrolled out of view.
   if (state.initials.enabled && (initials.error || initials.misfit.length)) return initials.messages.join(" ");
   if (!state.signatures.length && !initials.instances.length) return "Add a signature or initials.";
@@ -584,10 +630,20 @@ function render() {
   const initials = renderInitials();
   renderMarks();
   renderList();
+  els.optProtocol.disabled = app.signedMode;
+  els.docNotice.textContent = app.signedMode ? "" : (app.signaturesHint ? SIGNATURE_FIELDS_NOTICE : "");
+  els.docNotice.hidden = !els.docNotice.textContent;
+  els.signNotice.textContent = app.signedMode && !app.resultUrl ? SIGNED_MODE_NOTICE : "";
+  els.signNotice.hidden = !els.signNotice.textContent;
   const blocker = signBlocker(initials);
   els.sign.disabled = Boolean(blocker) || app.signing;
   els.sign.textContent = app.signing ? "Signing…" : "Sign document";
-  let hint = blocker || (app.resultUrl ? "" : "Ready to sign.");
+  const overlapping = state.signatures.filter(overlapsExistingSignature).length;
+  const overlapHint = overlapping
+    ? `${overlapping === 1 ? "A signature overlaps" : `${overlapping} signatures overlap`} an existing `
+      + "signature field and may hide it. "
+    : "";
+  let hint = blocker || overlapHint + (app.resultUrl ? "" : "Ready to sign.");
   if (app.signing) hint = app.signSeq === app.signingSeq ? "" : "Inputs changed; this result will be discarded.";
   else if (app.staleNotice) hint = app.staleNotice;
   els.signHint.textContent = hint;
@@ -598,6 +654,7 @@ function render() {
 async function sign() {
   if (els.sign.disabled || app.signing) return;
   const seq = ++app.signSeq;
+  const docSeq = app.docSeq;
   const pdfName = app.pdf.name;
   clearResult();
   app.staleNotice = null;
@@ -609,9 +666,10 @@ async function sign() {
       pdf: app.pdf,
       p12: app.p12,
       password: els.password.value,
-      placements: placementsPayload(state),
+      // Signed mode sends signatures only and never the protocol, whatever the controls say.
+      placements: placementsPayload(state).filter((p) => !app.signedMode || p.type === "signature"),
       lock: els.optLock.checked,
-      protocol: els.optProtocol.checked,
+      protocol: els.optProtocol.checked && !app.signedMode,
     });
     if (seq !== app.signSeq) {
       app.staleNotice = "The document or settings changed while signing. Sign again to get an up-to-date file.";
@@ -624,6 +682,15 @@ async function sign() {
   } catch (error) {
     if (seq !== app.signSeq) {
       app.staleNotice = "The document or settings changed while signing. Sign again to get an up-to-date file.";
+      return;
+    }
+    if (docSeq === app.docSeq && error.code === "signed_document") {
+      enterSignedMode();
+      changed(); // the options changed: a deliberate second click is needed
+      return;
+    }
+    if (docSeq === app.docSeq && (error.code === "locked_document" || error.code === "invalid_existing_signatures")) {
+      app.blockedMessage = error.message; // kept until the document changes
       return;
     }
     showError(error.message);

@@ -4,9 +4,11 @@
 const TOKEN = document.querySelector('meta[name="esign-token"]').content;
 
 export class ApiError extends Error {
-  constructor(message, status) {
+  /** ``code`` is the server's machine-readable reason (e.g. "signed_document"), or null. */
+  constructor(message, status, code = null) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -25,13 +27,15 @@ async function post(path, form) {
   }
   if (!response.ok) {
     let message = `Request failed (${response.status}).`;
+    let code = null;
     try {
       const body = await response.json();
       if (body && typeof body.error === "string") message = body.error;
+      if (body && typeof body.code === "string") code = body.code;
     } catch {
       // Not JSON: keep the generic message.
     }
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, code);
   }
   return response;
 }

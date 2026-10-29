@@ -48,6 +48,7 @@
             <span class="file-name" id="pdf-name">No file chosen</span>
           </label>
           <p class="muted small" id="doc-info"></p>
+          <p class="notice small" id="doc-notice" hidden></p>
         </li>
 
         <li class="step" id="step-certificate">
@@ -134,6 +135,7 @@
           <h2><span class="step-num">5</span>Sign</h2>
           <p class="muted small" id="sign-hint" aria-live="polite"></p>
         </div>
+        <p class="notice small" id="sign-notice" role="status" hidden></p>
         <button type="button" class="button primary block" id="sign" disabled>Sign document</button>
         <p class="error small" id="sign-error" role="alert" hidden></p>
         <a class="button success block" id="download" hidden>Download signed PDF</a>
