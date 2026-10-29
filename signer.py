@@ -876,10 +876,18 @@ def _filled_signature_holders(handler: Any) -> Set[Tuple[Any, ...]]:
     return holders
 
 
+def _has_signature_permissions(root: Any) -> bool:
+    """Catalog /Perms that refers to a signature (/DocMDP certification or /UR3, /UR usage
+    rights). An empty or unrelated /Perms, or /Perms null, is not a signature."""
+    perms = _deref(root.get("/Perms"))
+    return isinstance(perms, generic.DictionaryObject) and any(
+        key in perms for key in ("/DocMDP", "/UR3", "/UR"))
+
+
 def _signed_in_any_revision(reader: PdfFileReader) -> bool:
     """True if the current or any earlier revision holds a signature, by any of:
     a filled /Sig field in the form tree or among page widgets (names optional), a catalog
-    /Perms dictionary, or a signature pyHanko embeds. pyHanko's resolver decodes name escapes,
+    /Perms with /DocMDP, /UR3 or /UR, or a signature pyHanko embeds. pyHanko's resolver decodes name escapes,
     object streams and hybrid cross-reference sections, so nothing depends on byte spelling."""
     try:
         if reader.embedded_signatures:
@@ -888,7 +896,7 @@ def _signed_in_any_revision(reader: PdfFileReader) -> bool:
         return True
     for revision in range(reader.total_revisions):
         resolver = reader.get_historical_resolver(revision)
-        if "/Perms" in resolver.root or _filled_signature_holders(resolver):
+        if _has_signature_permissions(resolver.root) or _filled_signature_holders(resolver):
             return True
     return False
 

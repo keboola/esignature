@@ -666,3 +666,25 @@ def test_catalog_perms_alone_counts_as_signed(party_b, monkeypatch):
         countersign(pdf, party_b)
     assert excinfo.value.code == CODE_INVALID_EXISTING
     assert saves == []
+
+
+@pytest.mark.parametrize("perms", ["<< >>", "null", "<< /Other 1 >>"])
+def test_empty_or_unrelated_perms_do_not_mark_a_pdf_as_signed(party_b, perms):
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.xref_set_key(doc.pdf_catalog(), "Perms", perms)
+    pdf = doc.tobytes()
+
+    out = countersign(pdf, party_b, add_protocol_page=True)
+
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+@pytest.mark.parametrize("key", ["DocMDP", "UR3", "UR"])
+def test_perms_with_a_signature_entry_counts_as_signed(party_b, key):
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.xref_set_key(doc.pdf_catalog(), "Perms", f"<< /{key} << /Type /Sig >> >>")
+    with pytest.raises(PdfInputError) as excinfo:
+        countersign(doc.tobytes(), party_b)
+    assert excinfo.value.code == CODE_INVALID_EXISTING
