@@ -35,7 +35,7 @@ def test_non_loopback_host_is_rejected(host):
     ("ESIGN_PORT", "abc"), ("ESIGN_PORT", "0"), ("ESIGN_PORT", "70000"),
     ("ESIGN_MAX_PDF_MB", "-1"), ("ESIGN_MAX_P12_KB", "1.5"), ("ESIGN_MAX_PLACEMENTS", "0"),
     ("ESIGN_MAX_IN_FLIGHT", "100"), ("ESIGN_MAX_EXISTING_SIGNATURES", "0"),
-    ("ESIGN_MAX_EXISTING_SIGNATURES", "many"),
+    ("ESIGN_MAX_EXISTING_SIGNATURES", "many"), ("ESIGN_MAX_REVISIONS", "0"), ("ESIGN_MAX_REVISIONS", "x"),
 ])
 def test_invalid_values_name_the_variable(name, value):
     with pytest.raises(ConfigError, match=name):
@@ -57,3 +57,8 @@ def test_body_timeout_setting():
 def test_max_existing_signatures_setting():
     assert load_settings({}).max_existing_signatures == 20
     assert load_settings({"ESIGN_MAX_EXISTING_SIGNATURES": "3"}).max_existing_signatures == 3
+
+
+def test_max_revisions_setting():
+    assert load_settings({}).max_revisions == 100
+    assert load_settings({"ESIGN_MAX_REVISIONS": "7"}).max_revisions == 7

@@ -20,7 +20,7 @@ from starlette.formparsers import MultiPartParser
 import server
 from config import Settings
 from tests.conftest import assert_all_signatures_ok, make_identity, make_pdf
-from tests.signed_fixtures import sign_as
+from tests.signed_fixtures import corrupt_signature_contents, sign_as, with_revisions
 
 BASE = "http://127.0.0.1:8501"
 ORIGIN = BASE
@@ -251,6 +251,25 @@ def test_existing_signature_limit_comes_from_config(identity, limit, status):
     assert response.status_code == status, response.text
     if status == 400:
         assert "already has 2 signatures; at most 1" in response.json()["error"]
+        assert response.json()["code"] == "too_many_signatures"
+
+
+def test_unreadable_existing_signature_is_400_with_a_code(client, identity):
+    corrupt = corrupt_signature_contents(sign_as(make_pdf(), make_identity(common_name="Alice Original")))
+    response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=corrupt))
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_existing_signatures"
+    assert "cannot be checked" in response.json()["error"]
+
+
+@pytest.mark.parametrize("limit, status", [(3, 400), (4, 200)])
+def test_revision_limit_comes_from_config(identity, limit, status):
+    four = with_revisions(make_pdf(), 3)
+    with TestClient(make_app(replace(SETTINGS, max_revisions=limit)), base_url=BASE) as client:
+        response = client.post("/api/sign", headers=auth(client), **sign_form(identity, pdf=four))
+    assert response.status_code == status, response.text
+    if status == 400:
+        assert response.json()["code"] == "too_many_revisions"
 
 
 def test_signer_name_comes_from_the_certificate(client, identity):

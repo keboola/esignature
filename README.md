@@ -53,6 +53,7 @@ app at startup with a message naming the variable.
 | `ESIGN_MAX_PLACEMENTS` | `1000` | Most signatures + initials in one signing |
 | `ESIGN_MAX_IN_FLIGHT` | `2` | Requests handled at once; more get "busy, try again" |
 | `ESIGN_BODY_TIMEOUT_S` | `30` | Seconds allowed to upload a request; slower uploads are cut off |
+| `ESIGN_MAX_REVISIONS` | `100` | Most revisions (incremental updates) an input PDF may have; each one is analysed when counter-signing |
 | `ESIGN_MAX_EXISTING_SIGNATURES` | `20` | Most signatures a document may already have to be counter-signed (each one is validated before and after signing) |
 
 ## How to use
@@ -88,6 +89,18 @@ Why initials and the protocol page are not available: both change page content o
 which an existing signature does not allow. Your full signatures are added as new signature
 fields whose appearance is your mark, which approval signatures permit.
 
+**What cannot be counter-signed, in plain words:**
+
+- **Documents certified by another tool.** Many e-signature services (for example DocuSign or
+  Adobe Sign completion certificates) *certify* the final document. A certification states which
+  changes are allowed afterwards, and standard validators report a newly added visible signature
+  as a disallowed change. Adding yours would make their seal look broken, so the app refuses.
+- **Signed documents that were re-saved or edited after signing** (for example "Save as" in a
+  viewer, or a tool that re-writes the whole file). The original signature then no longer matches
+  the file, or the file contains changes the signature does not allow. Ask the sender for the
+  original signed file; if the earlier signatures do not need to stay valid, print the document to
+  a new PDF and sign that.
+
 Documents that cannot be counter-signed safely are refused with a specific message:
 
 - **Certified or locked** – certified documents (any DocMDP permission), approval signatures
@@ -95,11 +108,12 @@ Documents that cannot be counter-signed safely are refused with a specific messa
   a visible signature would be reported as a disallowed change by standard validators.
 - **Existing signatures not intact** – an earlier signature is already broken, the document was
   changed after signing in a way the signature does not permit (page content, appearance,
-  rotation), or a signature field was removed.
+  rotation), or a signature was removed or replaced by another one under the same field name.
 - **Signature that cannot be checked** – an unsupported signature format (`/SubFilter`).
-- **Damaged signed PDF** – a signed file that only parses after repair; repairing it would break
-  the signatures.
-- **Too many signatures** – more than `ESIGN_MAX_EXISTING_SIGNATURES`.
+- **Damaged signed PDF** – a file that only parses after repair and contains signature data in
+  any revision; repairing it would break the signatures.
+- **Too many signatures or revisions** – more than `ESIGN_MAX_EXISTING_SIGNATURES` signatures, or
+  more than `ESIGN_MAX_REVISIONS` revisions (this limit applies to every input, signed or not).
 
 Document timestamps are kept valid like signatures. After signing, the app re-validates every
 original signature and refuses to return a file in which any of them would be broken.

@@ -7,6 +7,7 @@ with the original bytes.
 """
 
 import io
+import time
 
 import pymupdf
 import pytest
@@ -19,6 +20,8 @@ from signer import (
     CODE_INVALID_EXISTING,
     CODE_LOCKED_DOCUMENT,
     CODE_SIGNED_DOCUMENT,
+    CODE_TOO_MANY_REVISIONS,
+    CODE_TOO_MANY_SIGNATURES,
     PdfInputError,
     SigningError,
     sign_pdf_multiple,
@@ -28,13 +31,17 @@ from tests.signed_fixtures import (
     TestTsa,
     assert_every_signature_ok,
     broken_startxref,
+    corrupt_signature_contents,
     edit_page_content_after,
+    hide_signature_history,
     hybrid_xref_pdf,
     remove_field_after,
     replace_appearance_after,
+    replace_signature_in_same_field,
     rotate_page_after,
     sign_as,
     unsupported_subfilter,
+    with_revisions,
 )
 from tests.test_geometry import CROP, DISPLAYED, GEOMETRY_CASES, MEDIA
 
@@ -418,3 +425,105 @@ def test_mark_is_upright_and_field_rect_is_raw_on_rotated_pages(
         assert_mark_upright_at(page, DISPLAYED, "Bob Countersigner")
         # S1: the signature is the widget appearance, not page content.
         assert render(page, annots=False).getextrema() == ((255, 255), (255, 255), (255, 255))
+
+
+# --- Fix round 1: history, repair fallback, revision budget, unreadable CMS, field tree ----------
+
+@pytest.mark.parametrize("certified", [False, True], ids=["approval", "certified-p1-perms-removed"])
+def test_signature_replaced_under_the_same_field_name_is_refused(party_a, party_b, certified):
+    """Historical signatures are identified by field name AND signed byte range."""
+    original = sign_as(make_pdf(), party_a, certify=MDPPerm.NO_CHANGES if certified else None)
+    replaced = replace_signature_in_same_field(original, party_b)
+
+    assert_rejected(replaced, party_b, CODE_INVALID_EXISTING, "not intact or the document was changed")
+
+
+def test_hidden_signed_history_with_broken_startxref_is_never_repaired(party_a, party_b):
+    hidden = hide_signature_history(sign_as(make_pdf(), party_a))
+
+    assert_rejected(hidden, party_b, CODE_INVALID_EXISTING, "damaged")
+
+
+@pytest.mark.parametrize("marker", [
+    b"/ByteRange [0 1 2 3]", b"/Type/Sig ", b"/Type \n /Sig>>", b"/SubFilter /x", b"/DocTimeStamp",
+])
+def test_any_raw_signature_marker_in_an_unparsable_file_blocks_repair(party_b, marker):
+    pdf = make_pdf()
+    tail = pdf.rfind(b"startxref")
+    planted = pdf[:tail] + b"99 0 obj\n<< " + marker + b" >>\nendobj\n" + pdf[tail:]
+    assert_rejected(broken_startxref(planted), party_b, CODE_INVALID_EXISTING, "damaged")
+
+
+def test_unparsable_file_without_signature_markers_is_still_repaired(party_b):
+    out = countersign(broken_startxref(make_pdf(text="hello")), party_b)
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+@pytest.mark.parametrize("signed_input", [False, True], ids=["unsigned", "signed"])
+def test_too_many_revisions_are_refused_quickly(party_a, party_b, signed_input):
+    pdf = sign_as(make_pdf(), party_a, box=None) if signed_input else make_pdf()
+    many = with_revisions(pdf, signer_module.DEFAULT_MAX_REVISIONS + 1 - (1 if signed_input else 0))
+
+    started = time.monotonic()
+    error = assert_rejected(many, party_b, CODE_TOO_MANY_REVISIONS, "too many revisions")
+    assert time.monotonic() - started < 3
+    assert f"at most {signer_module.DEFAULT_MAX_REVISIONS}" in str(error)
+
+
+def test_revision_limit_is_a_parameter(party_b):
+    five = with_revisions(make_pdf(), 4)  # 5 revisions in total
+    assert_rejected(five, party_b, CODE_TOO_MANY_REVISIONS, "too many revisions", max_revisions=4)
+    countersign(five, party_b, max_revisions=5)
+
+
+def test_unsigned_input_never_walks_the_signature_history(party_b, monkeypatch):
+    def forbidden(_reader):
+        raise AssertionError("history walked for unsigned input")
+
+    monkeypatch.setattr(signer_module, "_historical_signature_identities", forbidden)
+    out = countersign(with_revisions(make_pdf(), 20), party_b)
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+def test_unreadable_signature_cms_is_a_clear_refusal(party_a, party_b):
+    corrupt = corrupt_signature_contents(sign_as(make_pdf(), party_a))
+    assert_rejected(corrupt, party_b, CODE_INVALID_EXISTING, "cannot be checked")
+
+
+def test_non_dictionary_field_entry_is_refused_as_malformed(party_b):
+    doc = pymupdf.open()
+    doc.new_page()
+    number = doc.get_new_xref()
+    doc.update_object(number, "42")
+    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{number} 0 R] >>")
+    with pytest.raises(PdfInputError, match="malformed form fields"):
+        countersign(doc.tobytes(), party_b)
+
+
+def test_invalid_existing_message_tells_the_user_what_to_do(party_b, signed_by_a):
+    tampered = edit_page_content_after(signed_by_a)
+    error = assert_rejected(tampered, party_b, CODE_INVALID_EXISTING, "not intact")
+    assert str(error) == (
+        "The existing signatures are not intact or the document was changed after it was signed, so a "
+        "new signature cannot be added without making that visible. Ask the sender for the original "
+        "signed file, or, if the earlier signatures do not need to stay valid, print the document to a "
+        "new PDF and sign that.")
+
+
+def test_existing_signature_limit_carries_a_code(party_a, party_b):
+    three = signed_n_times(party_a, 3)
+    assert_rejected(three, party_b, CODE_TOO_MANY_SIGNATURES, "at most 2", max_existing_signatures=2)
+
+
+def test_unsigned_form_with_seed_value_subfilter_is_still_signed_normally(party_b):
+    """/SubFilter also appears in seed values of EMPTY fields; only an unparsable file treats it
+    as a signature marker."""
+    doc = pymupdf.open()
+    doc.new_page()
+    field = doc.get_new_xref()
+    doc.update_object(field, "<< /FT /Sig /T (Empty) /SV << /SubFilter [/adbe.pkcs7.detached] >> >>")
+    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", f"<< /Fields [{field} 0 R] >>")
+
+    out = countersign(doc.tobytes(), party_b, add_protocol_page=True)
+
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])

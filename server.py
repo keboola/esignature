@@ -400,6 +400,7 @@ def sign_job(
             lock_after_signing=lock, add_protocol_page=protocol,
             max_placements=settings.max_placements,
             max_existing_signatures=settings.max_existing_signatures,
+            max_revisions=settings.max_revisions,
         )
         return Response(signed, media_type="application/pdf",
                         headers={"Content-Disposition": 'attachment; filename="signed.pdf"'})

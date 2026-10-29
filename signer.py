@@ -639,10 +639,15 @@ MAX_FIELD_TREE_DEPTH = 64
 # Default upper bound for existing signatures validated before counter-signing (config overrides it).
 DEFAULT_MAX_EXISTING_SIGNATURES = 20
 
+# Default upper bound for revisions (incremental updates) of an input PDF (config overrides it).
+DEFAULT_MAX_REVISIONS = 100
+
 # Machine-readable error codes for the API (see PdfInputError.code).
 CODE_SIGNED_DOCUMENT = "signed_document"
 CODE_LOCKED_DOCUMENT = "locked_document"
 CODE_INVALID_EXISTING = "invalid_existing_signatures"
+CODE_TOO_MANY_SIGNATURES = "too_many_signatures"
+CODE_TOO_MANY_REVISIONS = "too_many_revisions"
 
 MSG_SIGNED_EXTRAS = (
     "This document is already signed. Initials and the protocol page cannot be added without "
@@ -656,7 +661,10 @@ MSG_UNSUPPORTED_SIGNATURE = (
     "so it cannot be counter-signed safely."
 )
 MSG_INVALID_EXISTING = (
-    "The existing signatures are not intact or the document was changed after signing."
+    "The existing signatures are not intact or the document was changed after it was signed, so a new "
+    "signature cannot be added without making that visible. Ask the sender for the original signed "
+    "file, or, if the earlier signatures do not need to stay valid, print the document to a new PDF "
+    "and sign that."
 )
 MSG_LOCKED = (
     "The document was certified or locked by a previous signer and does not allow new signatures."
@@ -707,7 +715,8 @@ def _acroform_field_names(reader: Any) -> Set[str]:
             seen.add(key)
             field = item.get_object()
             if not isinstance(field, generic.DictionaryObject):
-                continue  # a dangling or null entry is not a field
+                # Not a field (a number, a dangling reference...): the tree is not what it claims.
+                raise PdfInputError(MSG_MALFORMED_FIELDS)
             partial = _deref(field.get("/T"))
             name = prefix
             if partial is not None:
@@ -743,25 +752,21 @@ def _open_input_document(pdf_bytes: bytes) -> pymupdf.Document:
     return doc
 
 
-def _has_signature_objects(doc: pymupdf.Document) -> bool:
-    """True if any object looks like a signature value (/ByteRange) or a filled /Sig field.
+# Signature markers in raw bytes. Signature value dictionaries cannot live in compressed object
+# streams (their /ByteRange offsets point into the file), so a plain byte scan sees every
+# revision, including ones the current object graph no longer references.
+_RAW_SIGNATURE_MARKERS = re.compile(rb"/ByteRange|/SubFilter|/DocTimeStamp|/Type\s*/Sig(?![A-Za-z0-9])")
 
-    Used as a fail-closed fallback when pyHanko cannot parse the original bytes, and as a cross
-    check when it can: MuPDF also finds objects that are no longer reachable from the form.
-    """
-    for xref in range(1, doc.xref_length()):
-        try:
-            kind, _ = doc.xref_get_key(xref, "ByteRange")
-            if kind not in ("null", "undefined"):
-                return True
-            ft_kind, ft = doc.xref_get_key(xref, "FT")
-            if ft_kind == "name" and ft == "/Sig":
-                v_kind, _ = doc.xref_get_key(xref, "V")
-                if v_kind not in ("null", "undefined"):
-                    return True
-        except Exception:  # noqa: BLE001 - MuPDF raises its own error types for free/broken objects
-            continue  # an unreadable object is not a signature MuPDF can see
-    return False
+
+def _has_raw_signature_markers(original: bytes) -> bool:
+    """Any signature-related marker; used only when pyHanko cannot parse the file (fail closed)."""
+    return _RAW_SIGNATURE_MARKERS.search(original) is not None
+
+
+def _has_raw_signature_values(original: bytes) -> bool:
+    """A /ByteRange anywhere: a signature value in some revision. Used for parsable files, where
+    /SubFilter alone may just be a seed value of an empty field."""
+    return b"/ByteRange" in original
 
 
 @dataclass(frozen=True)
@@ -776,42 +781,46 @@ def _filled_signature_names(handler: Any) -> Set[str]:
     return {name for name, _, _ in fields.enumerate_sig_fields(handler, filled_status=True)}
 
 
-def _historical_signature_names(reader: PdfFileReader) -> Set[str]:
-    """Names of filled signature fields in every earlier revision (removed fields included)."""
-    names: Set[str] = set()
-    for revision in range(reader.total_revisions - 1):
-        names |= _filled_signature_names(reader.get_historical_resolver(revision))
-    return names
+def _check_revision_count(reader: PdfFileReader, max_revisions: int) -> None:
+    """Bound the work per revision (history walk, diff analysis) before any of it starts."""
+    revisions = reader.total_revisions
+    if revisions > max_revisions:
+        raise PdfInputError(
+            f"The PDF has too many revisions ({revisions}); at most {max_revisions} are supported.",
+            code=CODE_TOO_MANY_REVISIONS,
+        )
 
 
-def _classify_input(original: bytes, doc: pymupdf.Document) -> InputClassification:
+def _classify_input(original: bytes, max_revisions: int) -> InputClassification:
     """Decide signed vs unsigned on the ORIGINAL bytes, before any PyMuPDF serialisation.
 
-    - pyHanko (strict=False, so hybrid-reference files parse) finds a filled signature field in
-      the current or any earlier revision (document timestamps and unsupported /SubFilter values
-      included), or MuPDF sees signature objects -> signed;
-    - pyHanko cannot parse the file at all: signed (and rejected as damaged) if MuPDF finds any
-      signature object, otherwise unsigned so MuPDF may repair it as before;
+    - pyHanko (strict=False, so hybrid-reference files parse) finds a filled signature field
+      (document timestamps and unsupported /SubFilter values included), or the raw bytes of any
+      revision contain a signature value (/ByteRange) -> signed;
+    - pyHanko cannot parse the file at all: signed (and rejected as damaged) if the raw bytes
+      contain any signature marker; only a clean raw scan lets MuPDF repair it as unsigned;
+    - more revisions than ``max_revisions`` -> rejected before any per-revision work;
     - a form tree that cannot be traversed completely -> rejected.
+    The (costly) history walk happens only for signed input, in _check_existing_signatures.
     """
-    mupdf_sees_signatures = _has_signature_objects(doc)
     try:
         reader = PdfFileReader(io.BytesIO(original), strict=False)
         reader.root  # noqa: B018 - force the trailer and catalog to be read
     except Exception as e:  # noqa: BLE001 - any parse failure means "could not parse"
-        if mupdf_sees_signatures:
+        if _has_raw_signature_markers(original):
             raise PdfInputError(MSG_DAMAGED_SIGNED, code=CODE_INVALID_EXISTING) from e
         return InputClassification(signed=False, reader=None)
+    raw_markers = _has_raw_signature_values(original)
 
+    _check_revision_count(reader, max_revisions)
     try:
         _acroform_field_names(reader)
-        signed = bool(_filled_signature_names(reader)) or bool(_historical_signature_names(reader))
+        signed = bool(_filled_signature_names(reader))
     except PdfInputError:
         raise
     except Exception as e:  # noqa: BLE001 - a tree pyHanko cannot walk is not proof of "unsigned"
-        raise PdfInputError(MSG_MALFORMED_FIELDS, code=CODE_INVALID_EXISTING
-                            if mupdf_sees_signatures else None) from e
-    return InputClassification(signed=signed or mupdf_sees_signatures, reader=reader)
+        raise PdfInputError(MSG_MALFORMED_FIELDS, code=CODE_INVALID_EXISTING if raw_markers else None) from e
+    return InputClassification(signed=signed or raw_markers, reader=reader)
 
 
 # --- Existing signatures (signed input) ------------------------------------------------------------
@@ -826,6 +835,23 @@ class ExistingSignature:
 
 def _byte_range(sig: Any) -> Tuple[int, ...]:
     return tuple(int(v) for v in sig.sig_object["/ByteRange"])
+
+
+def _historical_signature_identities(reader: PdfFileReader) -> Set[ExistingSignature]:
+    """Every filled signature (field name + signed byte range) in every revision.
+
+    A signature that was later removed, or replaced by another value under the same field name,
+    shows up here but not among the current signatures.
+    """
+    identities: Set[ExistingSignature] = set()
+    for revision in range(reader.total_revisions):
+        resolver = reader.get_historical_resolver(revision)
+        for name, value, _ in fields.enumerate_sig_fields(resolver, filled_status=True):
+            byte_range = _deref(_deref(value).get("/ByteRange"))
+            if not isinstance(byte_range, generic.ArrayObject):
+                raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING)
+            identities.add(ExistingSignature(name, tuple(int(v) for v in byte_range)))
+    return identities
 
 
 def _signature_preserved(sig: Any) -> bool:
@@ -858,15 +884,27 @@ def _check_existing_signatures(
     if len(filled) > max_existing:
         raise PdfInputError(
             f"The document already has {len(filled)} signatures; at most {max_existing} existing "
-            "signatures can be checked before counter-signing."
+            "signatures can be checked before counter-signing.",
+            code=CODE_TOO_MANY_SIGNATURES,
         )
-    current = {name for name, _, _ in filled}
-    if _historical_signature_names(reader) - current:
-        # A signature field present in an earlier revision was removed later.
+    try:
+        # Parses every signature's CMS blob; an unreadable one must be a clear refusal.
+        embedded = reader.embedded_signatures
+        current = {ExistingSignature(sig.field_name, _byte_range(sig)) for sig in embedded}
+        historical = _historical_signature_identities(reader)
+    except PdfInputError:
+        raise
+    except Exception as e:  # noqa: BLE001 - unreadable signature data
+        logger.warning("Existing signatures could not be read: %s", type(e).__name__)
+        raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING) from e
+    if len(embedded) != len(filled):
+        # pyHanko skips signatures with an unsupported /SubFilter.
+        raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING)
+    if historical - current:
+        # A signature from an earlier revision was removed or replaced under the same name.
         raise PdfInputError(MSG_INVALID_EXISTING, code=CODE_INVALID_EXISTING)
-    embedded = reader.embedded_signatures
-    if not filled or len(embedded) != len(filled):
-        # pyHanko skips signatures with an unsupported /SubFilter; MuPDF-only finds land here too.
+    if not filled:
+        # Signature markers in the bytes, but no signature in any revision's form.
         raise PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING)
 
     if read_certification_data(reader) is not None:
@@ -1052,6 +1090,7 @@ def sign_pdf_multiple(
     reason: str = "Electronically signed",
     max_placements: int = DEFAULT_MAX_PLACEMENTS,
     max_existing_signatures: int = DEFAULT_MAX_EXISTING_SIGNATURES,
+    max_revisions: int = DEFAULT_MAX_REVISIONS,
 ) -> bytes:
     """
     Sign a PDF document with visible signatures and initials.
@@ -1078,6 +1117,7 @@ def sign_pdf_multiple(
         reason: Reason for signing
         max_placements: Upper bound for the number of placements
         max_existing_signatures: Upper bound for signatures already in the document
+        max_revisions: Upper bound for revisions (incremental updates) of the input
 
     Returns:
         Signed PDF as bytes
@@ -1097,7 +1137,7 @@ def sign_pdf_multiple(
 
         doc = _open_input_document(original)
         try:
-            classification = _classify_input(original, doc)
+            classification = _classify_input(original, max_revisions)
             placements = validate_placements(doc, signatures, max_placements)
             boxes = _signature_boxes(doc, placements)
             if classification.signed:

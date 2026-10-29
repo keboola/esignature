@@ -219,6 +219,59 @@ def remove_field_after(signed: bytes, field_name: str = "A") -> bytes:
     return _write(writer)
 
 
+def replace_signature_in_same_field(signed: bytes, replacer: Identity, field_name: str = "A") -> bytes:
+    """Clear A's /V (and any catalog /Perms) in one revision, then sign the SAME field as
+    ``replacer``: the field name survives, A's signature does not."""
+    writer = _writer(signed)
+    field = _signature_field(writer, field_name)
+    del field["/V"]
+    writer.update_container(field)
+    if "/Perms" in writer.root:
+        del writer.root["/Perms"]
+        writer.update_root()
+    cleared = _write(writer)
+    writer = _writer(cleared)
+    out = io.BytesIO()
+    signers.PdfSigner(
+        signers.PdfSignatureMetadata(field_name=field_name), signer=_simple_signer(replacer),
+    ).sign_pdf(writer, output=out)
+    return out.getvalue()
+
+
+def hide_signature_history(signed: bytes, field_name: str = "A") -> bytes:
+    """Remove A's field and widget, overwrite the field and signature-value objects with plain
+    dictionaries (so the CURRENT object graph has no signature), then break startxref."""
+    writer = _writer(signed)
+    field = _signature_field(writer, field_name)
+    value_ref = field.raw_get("/V")
+    field_ref = next(ref for ref in writer.root["/AcroForm"]["/Fields"]
+                     if ref.get_object().get("/T") == field_name)
+    hidden = remove_field_after(signed, field_name)
+    writer = _writer(hidden)
+    for ref in (field_ref, value_ref):
+        plain = generic.DictionaryObject({generic.NameObject("/Note"): generic.TextStringObject("plain")})
+        writer.objects[(ref.generation, ref.idnum)] = plain
+    return broken_startxref(_write(writer))
+
+
+def with_revisions(pdf: bytes, count: int) -> bytes:
+    """Append ``count`` incremental revisions that only change the document /Info."""
+    for number in range(count):
+        writer = _writer(pdf)
+        info = generic.DictionaryObject({
+            generic.NameObject("/Producer"): generic.TextStringObject(f"revision {number}")})
+        writer._info = writer.add_object(info)
+        writer.trailer["/Info"] = writer._info
+        pdf = _write(writer)
+    return pdf
+
+
+def corrupt_signature_contents(signed: bytes) -> bytes:
+    """Overwrite the first bytes of A's CMS blob (/Contents hex), keeping every offset."""
+    start = signed.index(b"/Contents <") + len(b"/Contents <")
+    return signed[:start] + b"ffff" + signed[start + 4:]
+
+
 # --- Assertions ------------------------------------------------------------------------------------
 
 def assert_every_signature_ok(

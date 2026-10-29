@@ -28,6 +28,8 @@ class Settings:
     max_placements: int = 1000
     # Signatures already in a document that are validated before counter-signing; more are refused.
     max_existing_signatures: int = 20
+    # Revisions (incremental updates) an input PDF may have; bounds per-revision validation work.
+    max_revisions: int = 100
     # Requests admitted at once (being uploaded, parsed, queued or signed); more get 503.
     max_in_flight: int = 2
     # Seconds a client may take to send a whole request body; slower uploads get 408.
@@ -86,6 +88,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         max_placements=_int(env, "ESIGN_MAX_PLACEMENTS", defaults.max_placements, 1, 10000),
         max_existing_signatures=_int(
             env, "ESIGN_MAX_EXISTING_SIGNATURES", defaults.max_existing_signatures, 1, 500),
+        max_revisions=_int(env, "ESIGN_MAX_REVISIONS", defaults.max_revisions, 1, 10000),
         max_in_flight=_int(env, "ESIGN_MAX_IN_FLIGHT", defaults.max_in_flight, 1, 16),
         body_timeout_s=_int(env, "ESIGN_BODY_TIMEOUT_S", int(defaults.body_timeout_s), 1, 3600),
     )
