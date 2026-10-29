@@ -688,3 +688,13 @@ def test_perms_with_a_signature_entry_counts_as_signed(party_b, key):
     with pytest.raises(PdfInputError) as excinfo:
         countersign(doc.tobytes(), party_b)
     assert excinfo.value.code == CODE_INVALID_EXISTING
+
+
+def test_revision_cap_applies_to_unparsable_files_before_repair(party_b):
+    damaged = broken_startxref(with_revisions(make_pdf(), 1))  # 2 revisions, pyHanko cannot parse
+    assert_rejected(damaged, party_b, CODE_TOO_MANY_REVISIONS, "too many revisions", max_revisions=1)
+
+
+def test_damaged_single_revision_pdf_still_repairs_within_the_cap(party_b):
+    out = countersign(broken_startxref(make_pdf(text="hello")), party_b, max_revisions=1)
+    assert_every_signature_ok(out, roots(party_b), ["Signature_1"])

@@ -781,9 +781,8 @@ class InputClassification:
     reader: Optional[PdfFileReader]
 
 
-def _check_revision_count(reader: PdfFileReader, max_revisions: int) -> None:
-    """Bound the work per revision (history walk, diff analysis) before any of it starts."""
-    revisions = reader.total_revisions
+def _check_revision_count(revisions: int, max_revisions: int) -> None:
+    """Bound the work per revision (history walk, diff analysis, repair) before any of it starts."""
     if revisions > max_revisions:
         raise PdfInputError(
             f"The PDF has too many revisions ({revisions}); at most {max_revisions} are supported.",
@@ -929,11 +928,14 @@ def _classify_input(original: bytes, max_revisions: int) -> InputClassification:
         reader = PdfFileReader(io.BytesIO(original), strict=False)
         reader.root  # noqa: B018 - force the trailer and catalog to be read
     except Exception as e:  # noqa: BLE001 - any parse failure means "could not parse"
+        # The cross-reference chain is unreadable, so count revisions from the raw bytes: every
+        # revision (incremental update) ends with its own %%EOF marker.
+        _check_revision_count(original.count(b"%%EOF"), max_revisions)
         if _may_contain_signatures(original):
             raise PdfInputError(MSG_DAMAGED_SIGNED, code=CODE_INVALID_EXISTING) from e
         return InputClassification(signed=False, reader=None)
 
-    _check_revision_count(reader, max_revisions)
+    _check_revision_count(reader.total_revisions, max_revisions)
     try:
         _acroform_field_names(reader)
         signed = _signed_in_any_revision(reader)
