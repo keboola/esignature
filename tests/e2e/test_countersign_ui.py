@@ -14,11 +14,12 @@ from pyhanko.sign.fields import MDPPerm
 
 from tests.conftest import make_identity, make_pdf
 from tests.e2e.test_editor import blank_pdf, open_editor, place, sign_and_download, write
-from tests.signed_fixtures import assert_every_signature_ok, sign_as
+from tests.signed_fixtures import assert_every_signature_ok, sign_as, with_revisions
 
 SIGNED_NOTICE = ("This document is already signed. Your signature will be added; initials and the "
                  "protocol page are not available. Click Sign again.")
 FIELDS_NOTICE = "This document seems to contain signature fields."
+NOT_AVAILABLE = "Not available: this document is already signed."
 # A's visible widget in fixtures: raw [300 600 450 650] on a 595 x 842 page = displayed (300, 192).
 A_WIDGET_DISPLAYED = (300, 192, 450, 242)
 
@@ -108,6 +109,9 @@ def test_signed_pdf_switches_to_signed_mode_and_second_sign_keeps_both_valid(
     expect(page.locator(".mark-signature")).to_have_count(1)
     expect(page.locator("#download")).to_be_hidden()
     expect(page.locator("#sign-error")).to_be_hidden()
+    # U2: the reason sits right next to the disabled controls.
+    expect(page.locator("#protocol-note")).to_have_text(NOT_AVAILABLE)
+    expect(page.locator("#initials-note")).to_have_text(NOT_AVAILABLE)
     # Further edits must not re-enable the initials (renderInitials respects signed mode).
     page.keyboard.press("ArrowRight")
     expect(page.locator("#initials-on")).to_be_disabled()
@@ -180,6 +184,47 @@ def test_certified_document_shows_the_locked_message(page: Page, base_url, tmp_p
     expect(page.locator("#sign")).to_be_disabled()
     expect(page.locator(".mark-signature")).to_have_count(1)  # placements kept
     page.keyboard.press("ArrowRight")  # editing does not unblock it
+    expect(page.locator("#sign")).to_be_disabled()
+
+    page.set_input_files("#pdf-input", write(tmp_path, "plain.pdf", blank_pdf(1)))
+    expect(page.locator("#doc-info")).to_have_text("1 page")
+    place(page, 0, 200, 450, 595)
+    expect(page.locator("#sign")).to_be_enabled()
+
+
+def test_signed_mode_without_signatures_asks_for_a_signature_only(
+        page: Page, base_url, tmp_path, party_b, signed_by_a):
+    """U3: no initials in the hint once the document is known to be signed."""
+    open_editor(page, base_url, tmp_path, signed_by_a, party_b)
+    expect(page.locator("#protocol-note")).to_be_hidden()
+    page.check("#opt-protocol")
+    place(page, 0, 200, 450, 595)
+    page.click("#sign")
+    expect(page.locator("#sign-notice")).to_be_visible()
+    page.locator(".mark-signature").focus()
+    page.keyboard.press("Delete")
+    expect(page.locator("#sign-hint")).to_have_text("Add a signature.")
+    expect(page.locator("#sign")).to_be_disabled()
+
+
+@pytest.mark.parametrize("kind", ["signatures", "revisions"])
+def test_too_many_signatures_or_revisions_block_sign_for_that_document(
+        page: Page, base_url, tmp_path, party_a, party_b, kind):
+    """U4: like a locked document, the refusal stays until the document changes."""
+    if kind == "signatures":
+        pdf = make_pdf()
+        for number in range(21):
+            pdf = off_loop(sign_as, pdf, party_a, field_name=f"A{number}", box=None)
+        message = "already has 21 signatures; at most 20"
+    else:
+        pdf = off_loop(with_revisions, make_pdf(), 100)
+        message = "too many revisions (101); at most 100"
+    open_editor(page, base_url, tmp_path, pdf, party_b)
+    place(page, 0, 200, 450, 595)
+    page.click("#sign")
+    expect(page.locator("#sign-hint")).to_contain_text(message)
+    expect(page.locator("#sign")).to_be_disabled()
+    page.keyboard.press("ArrowRight")
     expect(page.locator("#sign")).to_be_disabled()
 
     page.set_input_files("#pdf-input", write(tmp_path, "plain.pdf", blank_pdf(1)))

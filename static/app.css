@@ -208,6 +208,8 @@ button:disabled { opacity: 0.45; cursor: default; }
   background: #fff6e5; border: 1px solid #f2d39b; color: #6b4300;
 }
 .step p.notice { margin: 8px 0 0; }
+/* Reason shown right next to a control that signed mode disabled. */
+.step p.inline-note { margin: 2px 0 6px 26px; color: #6b4300; }
 
 .file-field {
   display: flex; align-items: center; gap: 10px; cursor: pointer; position: relative;

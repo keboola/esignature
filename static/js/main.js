@@ -51,6 +51,8 @@ const els = {
   initialsMy: $("initials-my"),
   initialsWarning: $("initials-warning"),
   optProtocol: $("opt-protocol"),
+  protocolNote: $("protocol-note"),
+  initialsNote: $("initials-note"),
   optLock: $("opt-lock"),
   sign: $("sign"),
   signHint: $("sign-hint"),
@@ -88,6 +90,11 @@ const app = {
 
 const SIGNED_MODE_NOTICE = "This document is already signed. Your signature will be added; initials "
   + "and the protocol page are not available. Click Sign again.";
+const NOT_AVAILABLE_SIGNED = "Not available: this document is already signed.";
+// Server refusals that hold for this document until another one is chosen.
+const BLOCKING_CODES = new Set([
+  "locked_document", "invalid_existing_signatures", "too_many_signatures", "too_many_revisions",
+]);
 const SIGNATURE_FIELDS_NOTICE = "This document seems to contain signature fields. If it is already "
   + "signed, initials and the protocol page are not available.";
 
@@ -617,7 +624,9 @@ function signBlocker(initials) {
   if (app.blockedMessage) return `${app.blockedMessage} Choose another document to sign.`;
   // Say exactly what is wrong: the initials settings may be scrolled out of view.
   if (state.initials.enabled && (initials.error || initials.misfit.length)) return initials.messages.join(" ");
-  if (!state.signatures.length && !initials.instances.length) return "Add a signature or initials.";
+  if (!state.signatures.length && !initials.instances.length) {
+    return app.signedMode ? "Add a signature." : "Add a signature or initials.";
+  }
   return null;
 }
 
@@ -631,6 +640,10 @@ function render() {
   renderMarks();
   renderList();
   els.optProtocol.disabled = app.signedMode;
+  for (const note of [els.protocolNote, els.initialsNote]) {
+    note.textContent = app.signedMode ? NOT_AVAILABLE_SIGNED : "";
+    note.hidden = !app.signedMode;
+  }
   els.docNotice.textContent = app.signedMode ? "" : (app.signaturesHint ? SIGNATURE_FIELDS_NOTICE : "");
   els.docNotice.hidden = !els.docNotice.textContent;
   els.signNotice.textContent = app.signedMode && !app.resultUrl ? SIGNED_MODE_NOTICE : "";
@@ -689,7 +702,7 @@ async function sign() {
       changed(); // the options changed: a deliberate second click is needed
       return;
     }
-    if (docSeq === app.docSeq && (error.code === "locked_document" || error.code === "invalid_existing_signatures")) {
+    if (docSeq === app.docSeq && BLOCKING_CODES.has(error.code)) {
       app.blockedMessage = error.message; // kept until the document changes
       return;
     }
