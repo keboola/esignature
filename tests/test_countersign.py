@@ -43,6 +43,7 @@ from tests.signed_fixtures import (
     replace_signature_in_same_field,
     rotate_page_after,
     sign_as,
+    unnamed_signature_fields,
     unsupported_subfilter,
     with_revisions,
 )
@@ -604,3 +605,64 @@ def test_unsigned_form_with_seed_value_subfilter_is_still_signed_normally(party_
     out = countersign(seed_value_form(), party_b, add_protocol_page=True)
 
     assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+# --- Fix round 3: classification does not depend on field names ----------------------------------------
+
+UNCHECKABLE = ("This document contains a signature that this tool cannot check, so it cannot be "
+               "counter-signed safely.")
+
+
+def forbid_saves(monkeypatch) -> list:
+    calls = []
+
+    def guard(method):
+        original = getattr(pymupdf.Document, method)
+
+        def recording(self, *args, **kwargs):
+            calls.append(method)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(pymupdf.Document, method, recording)
+
+    for method in ("tobytes", "write", "save", "ez_save"):
+        guard(method)
+    return calls
+
+
+@pytest.mark.parametrize("widget_only", [False, True], ids=["in-fields", "widget-only"])
+def test_unnamed_signed_field_is_refused_and_never_saved(party_a, party_b, monkeypatch, widget_only):
+    with unnamed_signature_fields(widget_only=widget_only):
+        unnamed = sign_as(make_pdf(), party_a)
+    assert b"/ByteRange" in unnamed and b"/T (A)" not in unnamed
+
+    saves = forbid_saves(monkeypatch)
+    error = assert_rejected(unnamed, party_b, CODE_INVALID_EXISTING, "cannot check")
+    assert str(error) == UNCHECKABLE
+    assert saves == []
+
+
+def test_unnamed_signed_field_in_an_earlier_revision_is_refused(party_a, party_b, monkeypatch):
+    with unnamed_signature_fields():
+        unnamed = sign_as(make_pdf(), party_a)
+    later = with_revisions(unnamed, 2)
+
+    saves = forbid_saves(monkeypatch)
+    error = assert_rejected(later, party_b, CODE_INVALID_EXISTING, "cannot check")
+    assert str(error) == UNCHECKABLE
+    assert saves == []
+
+
+def test_catalog_perms_alone_counts_as_signed(party_b, monkeypatch):
+    doc = pymupdf.open()
+    doc.new_page()
+    perms = doc.get_new_xref()
+    doc.update_object(perms, "<< /DocMDP << /Type /Sig >> >>")
+    doc.xref_set_key(doc.pdf_catalog(), "Perms", f"{perms} 0 R")
+    pdf = doc.tobytes()
+
+    saves = forbid_saves(monkeypatch)
+    with pytest.raises(PdfInputError) as excinfo:
+        countersign(pdf, party_b)
+    assert excinfo.value.code == CODE_INVALID_EXISTING
+    assert saves == []

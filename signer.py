@@ -667,6 +667,9 @@ MSG_INVALID_EXISTING = (
     "file, or, if the earlier signatures do not need to stay valid, print the document to a new PDF "
     "and sign that."
 )
+MSG_UNCHECKABLE_SIGNATURE = (
+    "This document contains a signature that this tool cannot check, so it cannot be counter-signed safely."
+)
 MSG_LOCKED = (
     "The document was certified or locked by a previous signer and does not allow new signatures."
 )
@@ -788,15 +791,120 @@ def _check_revision_count(reader: PdfFileReader, max_revisions: int) -> None:
         )
 
 
+def _object_key(item: Any, resolved: Any) -> Tuple[Any, ...]:
+    if isinstance(item, generic.IndirectObject):
+        return ("ref", item.idnum, item.generation)
+    return ("inline", id(resolved))
+
+
+def _is_null(value: Any) -> bool:
+    value = _deref(value)
+    return value is None or isinstance(value, generic.NullObject)
+
+
+def _filled_signature_holders(handler: Any) -> Set[Tuple[Any, ...]]:
+    """Keys of every dictionary holding the /V of a signature field, in one revision.
+
+    Independent of field names: walks the form tree (/FT inherited from parents) AND every page's
+    annotations (widgets; /FT and /V looked up through /Parent), so unnamed fields and fields
+    missing from /Fields are found too.
+    """
+    holders: Set[Tuple[Any, ...]] = set()
+    root = handler.root
+
+    def walk_fields(items: Any, inherited_ft: Any, depth: int, seen: Set[Tuple[Any, ...]]) -> None:
+        items = _deref(items)
+        if not isinstance(items, generic.ArrayObject):
+            return
+        if depth > MAX_FIELD_TREE_DEPTH:
+            raise PdfInputError(MSG_MALFORMED_FIELDS)
+        for item in items:
+            node = _deref(item)
+            key = _object_key(item, node)
+            if key in seen or not isinstance(node, generic.DictionaryObject):
+                continue
+            seen.add(key)
+            ft = _deref(node.get("/FT", inherited_ft))
+            if ft == "/Sig" and not _is_null(node.get("/V")):
+                holders.add(key)
+            walk_fields(node.get("/Kids"), ft, depth + 1, seen)
+
+    acroform = _deref(root.get("/AcroForm"))
+    if isinstance(acroform, generic.DictionaryObject):
+        walk_fields(acroform.get("/Fields"), None, 0, set())
+
+    def signature_holder(item: Any) -> Optional[Tuple[Any, ...]]:
+        """Walk up /Parent from an annotation: the dict with /V if the field type is /Sig."""
+        ft = None
+        holder = None
+        node, ref = _deref(item), item
+        for _ in range(MAX_FIELD_TREE_DEPTH):
+            if not isinstance(node, generic.DictionaryObject):
+                break
+            if holder is None and not _is_null(node.get("/V")):
+                holder = _object_key(ref, node)
+            if ft is None and "/FT" in node:
+                ft = _deref(node["/FT"])
+            if "/Parent" not in node:
+                break
+            ref = node.raw_get("/Parent")
+            node = _deref(ref)
+        else:
+            raise PdfInputError(MSG_MALFORMED_FIELDS)
+        return holder if ft == "/Sig" else None
+
+    def walk_pages(node_ref: Any, depth: int, seen: Set[Tuple[Any, ...]]) -> None:
+        node = _deref(node_ref)
+        key = _object_key(node_ref, node)
+        if key in seen or not isinstance(node, generic.DictionaryObject):
+            return
+        if depth > MAX_FIELD_TREE_DEPTH:
+            raise PdfInputError(MSG_MALFORMED_FIELDS)
+        seen.add(key)
+        kids = _deref(node.get("/Kids"))
+        if isinstance(kids, generic.ArrayObject):
+            for kid in kids:
+                walk_pages(kid, depth + 1, seen)
+        annots = _deref(node.get("/Annots"))
+        if isinstance(annots, generic.ArrayObject):
+            for annot in annots:
+                holder = signature_holder(annot)
+                if holder is not None:
+                    holders.add(holder)
+
+    walk_pages(root.raw_get("/Pages") if "/Pages" in root else None, 0, set())
+    return holders
+
+
 def _signed_in_any_revision(reader: PdfFileReader) -> bool:
-    """True if the current or any earlier revision has a filled signature field (signatures and
-    document timestamps, any /SubFilter). pyHanko decodes name escapes, object streams and hybrid
-    cross-reference sections, so nothing here depends on how the bytes are spelled."""
+    """True if the current or any earlier revision holds a signature, by any of:
+    a filled /Sig field in the form tree or among page widgets (names optional), a catalog
+    /Perms dictionary, or a signature pyHanko embeds. pyHanko's resolver decodes name escapes,
+    object streams and hybrid cross-reference sections, so nothing depends on byte spelling."""
+    try:
+        if reader.embedded_signatures:
+            return True
+    except Exception:  # noqa: BLE001 - unreadable signature data is still signature data
+        return True
     for revision in range(reader.total_revisions):
         resolver = reader.get_historical_resolver(revision)
-        if any(True for _ in fields.enumerate_sig_fields(resolver, filled_status=True)):
+        if "/Perms" in resolver.root or _filled_signature_holders(resolver):
             return True
     return False
+
+
+def _check_all_signatures_checkable(reader: PdfFileReader) -> None:
+    """Refuse signatures the name-based checks cannot see (e.g. fields without /T, or widgets
+    missing from /Fields): every filled /Sig holder must be one pyHanko enumerates by name."""
+    for revision in range(reader.total_revisions):
+        resolver = reader.get_historical_resolver(revision)
+        named = {
+            ("ref", ref.idnum, ref.generation)
+            for _, _, ref in fields.enumerate_sig_fields(resolver, filled_status=True)
+            if isinstance(ref, generic.IndirectObject)
+        }
+        if _filled_signature_holders(resolver) - named:
+            raise PdfInputError(MSG_UNCHECKABLE_SIGNATURE, code=CODE_INVALID_EXISTING)
 
 
 def _classify_input(original: bytes, max_revisions: int) -> InputClassification:
@@ -885,6 +993,12 @@ def _check_existing_signatures(
     Returns:
         The identity of every original signature, for the post-check.
     """
+    try:
+        _check_all_signatures_checkable(reader)
+    except PdfInputError:
+        raise
+    except Exception as e:  # noqa: BLE001 - a history we cannot walk is not a checked history
+        raise PdfInputError(MSG_UNCHECKABLE_SIGNATURE, code=CODE_INVALID_EXISTING) from e
     filled = list(fields.enumerate_sig_fields(reader, filled_status=True))
     if len(filled) > max_existing:
         raise PdfInputError(

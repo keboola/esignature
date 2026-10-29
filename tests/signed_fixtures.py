@@ -126,6 +126,34 @@ def escaped_signature_names():
         generic.NameObject.write_to_stream = original
 
 
+# --- Unnamed signature fields ----------------------------------------------------------------------
+
+@contextlib.contextmanager
+def unnamed_signature_fields(widget_only: bool = False):
+    """While active, pyHanko writes signature fields WITHOUT /T (optional per PDF 32000 12.7.4.1).
+
+    widget_only: also write the form's /Fields as empty, so the signed field is reachable only
+    through the page's /Annots.
+    """
+    original = generic.DictionaryObject.write_to_stream
+
+    def write(self, stream, handler=None, container_ref=None):
+        if self.get("/FT") == "/Sig" or (widget_only and "/Fields" in self):
+            copy = generic.DictionaryObject(
+                {k: v for k, v in self.items() if not (k == "/T" and self.get("/FT") == "/Sig")})
+            if widget_only and "/Fields" in copy:
+                copy[generic.NameObject("/Fields")] = generic.ArrayObject()
+            original(copy, stream, handler, container_ref)
+        else:
+            original(self, stream, handler, container_ref)
+
+    generic.DictionaryObject.write_to_stream = write
+    try:
+        yield
+    finally:
+        generic.DictionaryObject.write_to_stream = original
+
+
 # --- Damaged and unusual files ---------------------------------------------------------------------
 
 def unsupported_subfilter(signed: bytes) -> bytes:
