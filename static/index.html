@@ -50,6 +50,18 @@
           <p class="muted small" id="doc-info"></p>
           <p class="notice small" id="doc-notice" hidden></p>
           <button type="button" class="button secondary block validate-button" id="validate" disabled>Validate signatures</button>
+          <details class="advanced-options">
+            <summary>Certificate checks &amp; timestamp</summary>
+            <p class="muted small" id="trust-setup">Checking configuration…</p>
+            <label class="check"><input type="checkbox" id="online-revocation" disabled>
+              <span>Check revocation online<small class="muted block">Contacts the configured CRL services.</small></span>
+            </label>
+            <p class="muted small" id="revocation-setup" hidden>Configure trust roots and CRL services to enable this check.</p>
+            <label class="check"><input type="checkbox" id="opt-timestamp" disabled>
+              <span>Add timestamp when signing<small class="muted block">Sends a digest to the configured timestamp service, not the PDF.</small></span>
+            </label>
+            <p class="muted small" id="timestamp-setup">Configure a timestamp service and trust roots to enable this option.</p>
+          </details>
           <div id="validation-results" class="validation-results" aria-live="polite" hidden></div>
         </li>
 

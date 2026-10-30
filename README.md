@@ -4,8 +4,9 @@ Sign PDF documents with your own P12/PFX certificate, on your own computer.
 
 eSignature is a small local web app: a PDF-viewer-like editor where you place visible signatures
 and initials on the pages, and a signer that adds cryptographically valid PDF signatures
-(via pyHanko) behind those marks. Nothing is uploaded anywhere: the app listens on
-`127.0.0.1` only, and the document and certificate are held in memory just for the request.
+(via pyHanko) behind those marks. The app listens on `127.0.0.1` only, and the document and
+certificate are held in memory just for the request. Optional online CRL checks and timestamping
+contact only services configured on the server; timestamping sends a digest, not the PDF.
 
 ![Keboola eSignature editor](docs/screenshot.png)
 
@@ -29,8 +30,10 @@ and initials on the pages, and a signer that adds cryptographically valid PDF si
 - **Counter-signing** – add your signature to a contract the other party already signed; their
   signature stays valid (see [Counter-signing signed PDFs](#counter-signing-signed-pdfs)).
 - **Validate signatures** – check the integrity, cryptographic validity and subsequent changes
-  for each existing signature without selecting a certificate. Certificate trust and revocation
-  are not checked.
+  for each existing signature without selecting a certificate. With explicitly configured trust
+  roots, certificate chains are checked at the current time. Online CRL checks are optional.
+- **Timestamp** – optionally add a timestamp using a configured HTTPS timestamp service. Without
+  a service and trust roots configured, the option is unavailable.
 
 ## Run it
 
@@ -60,16 +63,37 @@ app at startup with a message naming the variable.
 | `ESIGN_BODY_TIMEOUT_S` | `30` | Seconds allowed to upload a request; slower uploads are cut off |
 | `ESIGN_MAX_REVISIONS` | `100` | Most revisions (incremental updates) an input PDF may have; each one is analysed when counter-signing |
 | `ESIGN_MAX_EXISTING_SIGNATURES` | `20` | Most signatures a document may already have to be counter-signed (each one is validated before and after signing) |
+| `ESIGN_TRUST_ROOTS` | unset | Path to a PEM bundle of explicitly trusted certificate roots |
+| `ESIGN_INTERMEDIATE_CERTS` | unset | Path to a PEM bundle of intermediate certificates |
+| `ESIGN_CRL_URLS` | unset | JSON array of up to 8 explicitly configured HTTPS CRL URLs |
+| `ESIGN_TSA_URL` | unset | HTTPS timestamp service URL; no provider is assumed |
+| `ESIGN_TSA_USERNAME`, `ESIGN_TSA_PASSWORD` | unset | Optional timestamp service basic credentials; set both or neither |
+| `ESIGN_TSA_TRUST_ROOTS` | unset | PEM trust roots for the timestamp service; defaults to the general roots |
+
+URLs cannot include credentials or fragments. The app does not fetch URLs found in documents or
+certificates. Configure roots and CRL services before selecting online revocation checks; configure
+a timestamp service and its trust roots before selecting timestamping. Protect credential-bearing
+environment variables from other users on the computer.
+
+Online revocation checking uses only the configured CRLs; it does not use OCSP. A requested
+timestamp is checked against the configured timestamp roots before the signed file is returned;
+revocation is a separate, explicitly requested validation check. The app does not create PAdES
+LT or LTA signatures or establish historical long-term validation.
 
 ## How to use
 
 1. **Document** – choose a PDF (or drop it onto the page area). It is read once and opened in
    the browser; signing uses exactly those bytes, even if the file changes on disk later.
    Optionally click **Validate signatures** to check the selected PDF using the local server;
-   no signing certificate is needed. The result does not establish certificate trust or revocation.
+   no signing certificate is needed. Certificate chain validation uses only configured roots and
+   checks the current time; revocation is not checked unless you explicitly enable the online
+   option. An unknown or unchecked result is not a successful check. The online option contacts
+   the configured CRL services.
 2. **Certificate** – choose your `.p12`/`.pfx` file and type its password (leave it empty if the
    certificate has none). The app checks it and shows the name, issuer and validity.
-3. **Options** – add a protocol page and/or lock the PDF.
+3. **Options** – add a protocol page, lock the PDF, and optionally request a timestamp. The
+   timestamp service receives a digest of the signed data, not the PDF. A requested timestamp
+   must succeed for signing to complete.
 4. **Place** – click "Add signature", then click on a page. Drag the box to fine-tune it, or
    select it and use the arrow keys. Turn on "Initials on pages" for a paraph on each page.
    The boxes show a preview; the real mark contains your name, the signing time and a link.
@@ -129,8 +153,10 @@ Documents that cannot be counter-signed safely are refused with a specific messa
 Document timestamps are kept valid like signatures. After signing, the app re-validates every
 original signature and refuses to return a file in which any of them would be broken.
 
-Limits: the app checks that existing signatures are intact and unchanged, not that their
-certificates are trusted – that remains the reader's validator's job. Your new mark is opaque, so
+Limits: counter-signing checks existing signatures for integrity and permitted changes; it does
+not require their certificates to be trusted. Validation reports certificate chain and revocation
+separately. Current-time checks do not establish historical validity, legal qualification, or
+long-term validity. Your new mark is opaque, so
 a placement that overlaps an existing signature is flagged with a warning; signing is still
 allowed.
 

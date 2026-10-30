@@ -19,6 +19,7 @@ Signed input (counter-signing):
 Placements follow the contract documented in :mod:`geometry`.
 """
 
+import asyncio
 import io
 import logging
 import re
@@ -43,6 +44,14 @@ from pyhanko.sign.validation.pdf_embedded import read_certification_data
 from pyhanko.stamp import NoOpStampStyle, StaticStampStyle
 from pyhanko_certvalidator import ValidationContext
 
+from certificate_validation import (
+    ConfiguredTimeStamper,
+    TimestampConfig,
+    ValidationPolicy,
+    fetch_crls,
+    signature_security_details,
+    timestamp_details,
+)
 from geometry import (
     BOX_SIZES,
     DEFAULT_MAX_PLACEMENTS,
@@ -1092,12 +1101,15 @@ def validate_pdf_document(
     pdf_bytes: bytes,
     max_existing_signatures: int = DEFAULT_MAX_EXISTING_SIGNATURES,
     max_revisions: int = DEFAULT_MAX_REVISIONS,
+    validation_policy: Optional[ValidationPolicy] = None,
+    online_revocation: bool = False,
 ) -> Dict[str, Any]:
     """Inspect ORIGINAL PDF bytes locally without a signing key or document rewriting.
 
     Report byte integrity, mathematical signature validity and permitted changes separately.
-    Neither embedded certificates nor self-signed certificates are treated as trusted roots.
-    No online trust, revocation, qualified-signature or legal-validity assertion is made.
+    Only operator-configured roots establish certificate trust. Revocation uses configured
+    CRL URLs after explicit opt-in; no certificate/PDF-controlled URLs are fetched. This does
+    not assert qualified-signature status or legal validity.
     """
     doc = _open_input_document(pdf_bytes)
     doc.close()
@@ -1126,6 +1138,7 @@ def validate_pdf_document(
         # The signing path may repair an unsigned PDF; inspection cannot validate a repaired copy.
         return blocked(PdfInputError("The PDF needs repair before its signatures can be inspected."))
     reader = classification.reader
+    policy = validation_policy or ValidationPolicy()
     try:
         filled = list(fields.enumerate_sig_fields(reader, filled_status=True))
         result["signature_count"] = len(filled)
@@ -1135,6 +1148,9 @@ def validate_pdf_document(
                 code=CODE_TOO_MANY_SIGNATURES,
             )
         _normalise_linearized_signatures(reader)
+        # Network access is explicit, capped, and only to operator-configured CRL URLs.
+        crls = (asyncio.run(fetch_crls(policy))
+                if online_revocation and (policy.trust_roots or policy.timestamp_roots) else ())
         for sig in reader.embedded_signatures:
             signer_name = sig.signer_cert.subject.native.get("common_name") or "Unknown"
             entry = {
@@ -1155,7 +1171,16 @@ def validate_pdf_document(
                 })
             except Exception:  # noqa: BLE001 - unsupported CMS/algorithms produce an honest unknown
                 entry["error"] = "This signature could not be checked."
+            entry.update(signature_security_details(sig, policy, online=online_revocation, crls=crls))
             result["signatures"].append(entry)
+        if policy.trust_roots or policy.timestamp_roots:
+            result["trust"] = {
+                "status": "checked", "message": "Certificate chains checked against configured roots.",
+            }
+        if online_revocation and (policy.trust_roots or policy.timestamp_roots):
+            result["revocation"] = {
+                "status": "checked", "message": "See each signature for the CRL revocation result.",
+            }
         if classification.signed:
             names = _signature_field_names(1, _acroform_field_names(reader))
             _check_existing_signatures(reader, names, max_existing_signatures)
@@ -1335,6 +1360,7 @@ def _apply_signatures(
     mark_pdf: bytes,
     lock_after_signing: bool,
     reason: str,
+    timestamper=None,
 ) -> bytes:
     """Add one incremental signature per box; each new field's widget shows the mark (S1).
 
@@ -1375,6 +1401,7 @@ def _apply_signatures(
             signer=signer,
             stamp_style=stamp_style,
             new_field_spec=field_spec,
+            timestamper=timestamper,
         )
         out = io.BytesIO()
         pdf_signer.sign_pdf(writer, output=out)
@@ -1395,6 +1422,7 @@ def sign_pdf_multiple(
     max_placements: int = DEFAULT_MAX_PLACEMENTS,
     max_existing_signatures: int = DEFAULT_MAX_EXISTING_SIGNATURES,
     max_revisions: int = DEFAULT_MAX_REVISIONS,
+    timestamp_config: Optional[TimestampConfig] = None,
 ) -> bytes:
     """
     Sign a PDF document with visible signatures and initials.
@@ -1476,7 +1504,20 @@ def sign_pdf_multiple(
         finally:
             mark_doc.close()
 
-        output = _apply_signatures(base, signer, boxes, names, mark_pdf, lock_after_signing, reason)
+        try:
+            timestamper = ConfiguredTimeStamper(timestamp_config) if timestamp_config is not None else None
+            output = _apply_signatures(
+                base, signer, boxes, names, mark_pdf, lock_after_signing, reason, timestamper=timestamper,
+            )
+            if timestamp_config is not None:
+                _check_requested_timestamps(output, names, timestamp_config.validation_policy)
+        except Exception:
+            if timestamp_config is not None:
+                raise SigningError(
+                    "Timestamping failed or its trusted timestamp could not be verified. "
+                    "No signed file was returned."
+                ) from None
+            raise
         if classification.signed:
             _post_check(output, original, existing, names)
         return output
@@ -1488,6 +1529,19 @@ def sign_pdf_multiple(
         raise SigningError(
             "Signing failed because of an unexpected problem with the PDF or the certificate."
         ) from e
+
+
+def _check_requested_timestamps(output, names, policy):
+    reader = PdfFileReader(io.BytesIO(output), strict=False)
+    _normalise_linearized_signatures(reader)
+    by_name = {sig.field_name: sig for sig in reader.embedded_signatures}
+    for name in names:
+        sig = by_name.get(name)
+        if sig is None or not _signature_preserved(sig):
+            raise SigningError("The timestamped signature could not be verified.")
+        timestamp = timestamp_details(sig, policy)
+        if timestamp["status"] != "valid" or timestamp["certificate_trust"]["status"] != "trusted":
+            raise SigningError("The requested trusted timestamp could not be verified.")
 
 
 def _log_unexpected_error(error: BaseException, p12_password: str) -> None:

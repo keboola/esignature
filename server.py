@@ -33,6 +33,7 @@ from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from certificate_validation import TimestampConfig, load_validation_policy
 from config import LOOPBACK_HOSTS, ConfigError, Settings, load_settings
 from geometry import PlacementError
 from signer import (
@@ -393,7 +394,7 @@ def certificate_job(p12: bytes, password: str) -> Callable[[], Response]:
 
 def sign_job(
     pdf: bytes, p12: bytes, password: str, placements: Any, lock: bool, protocol: bool,
-    settings: Settings,
+    settings: Settings, timestamp_config: Optional[TimestampConfig] = None,
 ) -> Callable[[], Response]:
     def job() -> Response:
         signed = sign_pdf_multiple(
@@ -402,6 +403,7 @@ def sign_job(
             max_placements=settings.max_placements,
             max_existing_signatures=settings.max_existing_signatures,
             max_revisions=settings.max_revisions,
+            timestamp_config=timestamp_config,
         )
         return Response(signed, media_type="application/pdf",
                         headers={"Content-Disposition": 'attachment; filename="signed.pdf"'})
@@ -413,6 +415,18 @@ def sign_job(
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or Settings()
+    try:
+        policy = load_validation_policy(
+            trust_roots_path=settings.trust_roots_path,
+            intermediates_path=settings.intermediates_path,
+            tsa_trust_roots_path=settings.tsa_trust_roots_path,
+            crl_urls=settings.crl_urls,
+        )
+    except (ValueError, OSError):
+        raise ConfigError("Could not load the configured certificate bundles.") from None
+    trust_configured = bool(policy.trust_roots)
+    revocation_configured = bool((policy.trust_roots or policy.tsa_trust_roots) and policy.crl_urls)
+    timestamp_configured = bool(settings.tsa_url and (policy.tsa_trust_roots or policy.trust_roots))
     gate = SigningGate(settings.max_in_flight)
     token = secrets.token_urlsafe(32)
     index_html = (STATIC_DIR / "index.html").read_text(encoding="utf-8").replace(TOKEN_PLACEHOLDER, token)
@@ -430,6 +444,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/", include_in_schema=False)
     async def index() -> HTMLResponse:
         return HTMLResponse(index_html)
+
+    @app.get("/api/capabilities")
+    async def capabilities() -> JSONResponse:
+        return JSONResponse({"trust_configured": trust_configured,
+                             "revocation_configured": revocation_configured,
+                             "timestamp_configured": timestamp_configured})
 
     @app.post("/api/certificate")
     async def certificate(request: Request) -> Response:
@@ -450,25 +470,37 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             placements = parse_placements(require(form, "placements"))
             lock = parse_flag(form, "lock")
             protocol = parse_flag(form, "protocol")
+            timestamp = parse_flag(form, "timestamp")
+            if timestamp and not timestamp_configured:
+                raise ApiError(400, "Timestamping is not configured on this server.")
             check_size(pdf, settings.max_pdf_bytes, "PDF")
             check_size(p12, settings.max_p12_bytes, "certificate file")
-            return sign_job(pdf, p12, password, placements, lock, protocol, settings)
+            timestamp_config = TimestampConfig(
+                url=settings.tsa_url, validation_policy=policy,
+                username=settings.tsa_username, password=settings.tsa_password,
+            ) if timestamp else None
+            return sign_job(pdf, p12, password, placements, lock, protocol, settings, timestamp_config)
 
         return await run_admitted(
-            request, {"pdf", "p12"}, {"password", "placements", "lock", "protocol"}, prepare)
+            request, {"pdf", "p12"}, {"password", "placements", "lock", "protocol", "timestamp"}, prepare)
 
     @app.post("/api/validate")
     async def validate(request: Request) -> Response:
         def prepare(form: Dict[str, Any]) -> Callable[[], Response]:
             pdf = require(form, "pdf")
+            online = parse_flag(form, "online_revocation")
+            if online and not revocation_configured:
+                raise ApiError(400, "Online revocation checking is not configured on this server.")
             check_size(pdf, settings.max_pdf_bytes, "PDF")
             return lambda: JSONResponse(validate_pdf_document(
                 pdf,
                 max_existing_signatures=settings.max_existing_signatures,
                 max_revisions=settings.max_revisions,
+                validation_policy=policy,
+                online_revocation=online,
             ))
 
-        return await run_admitted(request, {"pdf"}, set(), prepare)
+        return await run_admitted(request, {"pdf"}, {"online_revocation"}, prepare)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")
@@ -492,12 +524,13 @@ def main() -> None:
         logging.getLogger(name).setLevel(logging.ERROR)
     try:
         settings = load_settings()
+        app = create_app(settings)
     except ConfigError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         sys.exit(2)
     print(f"Keboola eSignature is running at http://{settings.host}:{settings.port}", flush=True)
     uvicorn.run(
-        create_app(settings), host=settings.host, port=settings.port,
+        app, host=settings.host, port=settings.port,
         access_log=False, server_header=False, log_level="warning", workers=1,
     )
 
