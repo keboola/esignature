@@ -152,14 +152,37 @@ allowed.
 ## Development
 
 ```bash
-uv sync
+uv sync --locked --all-groups
 uv run playwright install chromium   # once, for the browser tests
 uv run pytest                        # signer, API and browser end-to-end tests
 uv run ruff check
 ```
 
-The linearized-PDF test is skipped unless `qpdf` is installed (PyMuPDF 2.0 no longer writes
-linearized files).
+Install `qpdf` and Poppler (`poppler-utils` on Ubuntu) to run every unit test. The linearized-PDF
+test needs `qpdf` because PyMuPDF 2.0 no longer writes linearized files. Independent signature
+checks need Poppler's `pdfsig`; these tests use generated certificates and synthetic PDFs only,
+disable certificate/online OCSP checks, and verify that tampering is detected.
+
+### Continuous integration
+
+[GitHub Actions](.github/workflows/ci.yml) runs on every pull request, on pushes to `main`, and
+when started manually. It checks lint and the unit/API tests on Python 3.11, 3.12, 3.13 and 3.14,
+with `qpdf` and Poppler installed. A separate Chromium job runs the browser tests against the
+real local app, including signing, counter-signing and validation.
+
+CI installs dependencies from `uv.lock` with `uv sync --locked`; dependency changes must update
+the lockfile. Actions are pinned to commit hashes and uv to a fixed version. Jobs have a
+read-only repository token, need no secrets or user certificates, and cancel outdated runs.
+
+To reproduce the two test jobs locally after installing the tools above:
+
+```bash
+uv sync --locked --all-groups
+uv run --no-sync ruff check .
+uv run --no-sync pytest -q tests --ignore=tests/e2e
+uv run --no-sync playwright install chromium
+uv run --no-sync pytest -q tests/e2e --browser chromium
+```
 
 Project layout:
 
