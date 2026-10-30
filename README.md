@@ -16,11 +16,13 @@ and initials on the pages, and a signer that adds cryptographically valid PDF si
 - **Click to place, drag to move** – arm "Add signature", click where it should go, drag it to
   adjust. Arrow keys nudge by 1 pt (Shift: 10 pt), Delete removes it.
 - **Multiple signatures** – each visible signature is its own cryptographic signature; all of them
-  stay valid.
+  stay valid. The mark is the signature field's appearance, upright on rotated pages too.
 - **Initials (paraph)** – one shared initials mark in an explicit corner (bottom right or bottom
   left) with margins in points, on all pages, all except the last, or a custom page list. Dragging
   it on any page moves it on every selected page. Pages where it would not fit are listed and
-  signing is blocked until fixed.
+  signing is blocked until fixed. Initials are visual marks drawn into the page and covered by the
+  document's signature(s), not separate signatures; a document with initials only gets one
+  invisible signature.
 - **Protocol page** – optional summary page with certificate and signature details.
 - **Lock after signing** – the last signature requests that no further changes are made
   (enforcement depends on the PDF viewer).
@@ -79,9 +81,10 @@ can add your own signature(s) and every earlier signature stays valid:
 1. Open the PDF and place your signature(s) as usual. If the document contains signature fields,
    the editor says so (the browser cannot tell whether they are filled, so it does not block
    anything yet).
-2. Click **Sign**. The app checks the document. If it is already signed, the editor switches to
-   *signed mode*: the protocol page and initials are switched off, your placements are kept, and
-   you click **Sign** again to add your signature.
+2. Click **Sign**. The app checks the document. If it is already signed and you placed only
+   signatures, it is signed right away. If you also turned on initials or the protocol page, the
+   editor switches to *signed mode* instead: both are switched off (with a note next to each),
+   your placements are kept, and you click **Sign** again to add your signature.
 3. Download the result. It is the original file byte for byte, with your signature(s) appended as
    incremental updates.
 
@@ -109,7 +112,8 @@ Documents that cannot be counter-signed safely are refused with a specific messa
 - **Existing signatures not intact** – an earlier signature is already broken, the document was
   changed after signing in a way the signature does not permit (page content, appearance,
   rotation), or a signature was removed or replaced by another one under the same field name.
-- **Signature that cannot be checked** – an unsupported signature format (`/SubFilter`).
+- **Signature that cannot be checked** – an unsupported signature format (`/SubFilter`), or a
+  signature field without a name.
 - **Damaged PDF that may contain signatures** – a file that only parses after repair is repaired
   and signed only if its raw bytes show no sign of a signature (signature names, even written with
   `#xx` escapes) and no compressed object streams, which could hide one. Otherwise repairing it
@@ -148,6 +152,9 @@ uv run playwright install chromium   # once, for the browser tests
 uv run pytest                        # signer, API and browser end-to-end tests
 uv run ruff check
 ```
+
+The linearized-PDF test is skipped unless `qpdf` is installed (PyMuPDF 2.0 no longer writes
+linearized files).
 
 Project layout:
 
