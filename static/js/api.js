@@ -55,14 +55,15 @@ export async function checkCertificate(p12, password) {
 }
 
 /** Check signatures in the selected PDF without a signing certificate. */
-export async function validateDocument(pdf) {
+export async function validateDocument(pdf, onlineRevocation = false) {
   const form = new FormData();
   form.append("pdf", ...part(pdf, "application/pdf"));
+  form.append("online_revocation", onlineRevocation ? "true" : "false");
   return (await post("/api/validate", form)).json();
 }
 
 /** Returns the signed PDF as a Blob. */
-export async function signDocument({ pdf, p12, password, placements, lock, protocol }) {
+export async function signDocument({ pdf, p12, password, placements, lock, protocol, timestamp }) {
   const form = new FormData();
   form.append("pdf", ...part(pdf, "application/pdf"));
   form.append("p12", ...part(p12, "application/x-pkcs12"));
@@ -70,5 +71,12 @@ export async function signDocument({ pdf, p12, password, placements, lock, proto
   form.append("placements", JSON.stringify(placements));
   form.append("lock", lock ? "true" : "false");
   form.append("protocol", protocol ? "true" : "false");
+  form.append("timestamp", timestamp ? "true" : "false");
   return (await post("/api/sign", form)).blob();
+}
+
+export async function getCapabilities() {
+  const response = await fetch("/api/capabilities", { credentials: "same-origin", cache: "no-store" });
+  if (!response.ok) throw new Error("Configuration is unavailable. Reload the page to try again.");
+  return response.json();
 }

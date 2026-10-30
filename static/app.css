@@ -216,6 +216,12 @@ button:disabled { opacity: 0.45; cursor: default; }
 .step .validation-results p:first-child { margin-top: 0; }
 .validation-heading { font-weight: 600; }
 .validation-signature { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+.advanced-options { margin-top: 8px; font-size: 12px; }
+.advanced-options summary { color: var(--accent-strong); cursor: pointer; }
+@media (min-width: 901px) {
+  .step { padding-top: 9px; padding-bottom: 10px; }
+  .step h2 { margin-bottom: 8px; }
+}
 
 .file-field {
   display: flex; align-items: center; gap: 10px; cursor: pointer; position: relative;

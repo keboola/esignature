@@ -62,3 +62,44 @@ def test_max_existing_signatures_setting():
 def test_max_revisions_setting():
     assert load_settings({}).max_revisions == 100
     assert load_settings({"ESIGN_MAX_REVISIONS": "7"}).max_revisions == 7
+
+
+def test_certificate_service_configuration_and_secret_repr():
+    settings = load_settings({
+        "ESIGN_TRUST_ROOTS": "/tmp/roots.pem", "ESIGN_INTERMEDIATE_CERTS": "/tmp/intermediate.pem",
+        "ESIGN_CRL_URLS": '["https://crl.example/issuer.crl"]',
+        "ESIGN_TSA_URL": "https://tsa.example/timestamp", "ESIGN_TSA_USERNAME": "my-user",
+        "ESIGN_TSA_PASSWORD": "secret-value", "ESIGN_TSA_TRUST_ROOTS": "/tmp/tsa.pem",
+    })
+    assert settings.crl_urls == ("https://crl.example/issuer.crl",)
+    assert settings.trust_roots_path == "/tmp/roots.pem"
+    assert settings.tsa_trust_roots_path == "/tmp/tsa.pem"
+    assert settings.tsa_password == "secret-value"
+    assert "my-user" not in repr(settings) and "secret-value" not in repr(settings)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("ESIGN_TSA_URL", "http://example.test"),
+    ("ESIGN_TSA_URL", "https://user:secret@example.test"),
+    ("ESIGN_TSA_URL", "https://example.test/#fragment"),
+    ("ESIGN_TSA_URL", "https://example.test:bad"),
+    ("ESIGN_CRL_URLS", '["https://user:secret@example.test"]'),
+    ("ESIGN_CRL_URLS", '["http://example.test"]'),
+    ("ESIGN_CRL_URLS", '{}'),
+    ("ESIGN_CRL_URLS", '["https://example.test", 1]'),
+    ("ESIGN_CRL_URLS", '["https://example.test", "https://example.test", "https://example.test", '
+                       '"https://example.test", "https://example.test", "https://example.test", '
+                       '"https://example.test", "https://example.test", "https://example.test"]'),
+])
+def test_invalid_online_configuration_does_not_echo_url(name, value):
+    with pytest.raises(ConfigError) as exc:
+        load_settings({name: value})
+    assert name in str(exc.value)
+    assert "secret" not in str(exc.value)
+
+
+def test_timestamp_credentials_must_be_paired():
+    with pytest.raises(ConfigError, match="ESIGN_TSA_USERNAME"):
+        load_settings({"ESIGN_TSA_USERNAME": "user"})
+    with pytest.raises(ConfigError, match="ESIGN_TSA_PASSWORD"):
+        load_settings({"ESIGN_TSA_PASSWORD": "secret"})

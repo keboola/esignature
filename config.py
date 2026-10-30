@@ -4,9 +4,11 @@ Every setting has a safe default; an invalid value stops the app at startup with
 names the variable. The server only ever binds to loopback.
 """
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
 # Host names the server may bind to and accept in the Host header. Loopback only.
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
@@ -34,6 +36,13 @@ class Settings:
     max_in_flight: int = 2
     # Seconds a client may take to send a whole request body; slower uploads get 408.
     body_timeout_s: float = 30
+    trust_roots_path: Optional[str] = None
+    intermediates_path: Optional[str] = None
+    crl_urls: tuple[str, ...] = ()
+    tsa_url: Optional[str] = None
+    tsa_username: Optional[str] = field(default=None, repr=False)
+    tsa_password: Optional[str] = field(default=None, repr=False)
+    tsa_trust_roots_path: Optional[str] = None
 
     @property
     def max_request_bytes(self) -> int:
@@ -65,6 +74,20 @@ def _int(env: Mapping[str, str], name: str, default: int, minimum: int, maximum:
     return value
 
 
+def _https_url(value: str, name: str) -> str:
+    # Never echo a URL in an error: it may contain accidentally pasted credentials.
+    try:
+        parsed = urlsplit(value)
+        valid = (value == value.strip() and not any(c.isspace() or ord(c) < 32 for c in value)
+                 and parsed.scheme == "https" and bool(parsed.hostname) and parsed.username is None
+                 and parsed.password is None and "#" not in value and parsed.port != 0)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f"{name} must contain HTTPS URLs without credentials or fragments.")
+    return value
+
+
 def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
     """Read settings from ``env`` (default: the process environment).
 
@@ -80,6 +103,23 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
             f"ESIGN_HOST must be a loopback address ({', '.join(LOOPBACK_HOSTS)}), got {host!r}."
         )
 
+    raw_crls = env.get("ESIGN_CRL_URLS", "").strip()
+    try:
+        crl_urls = json.loads(raw_crls) if raw_crls else []
+        if (not isinstance(crl_urls, list) or len(crl_urls) > 8
+                or any(not isinstance(x, str) for x in crl_urls)):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ConfigError("ESIGN_CRL_URLS must be a JSON array of at most 8 HTTPS URLs.") from None
+    crl_urls = tuple(_https_url(url, "ESIGN_CRL_URLS") for url in crl_urls)
+    tsa_url = env.get("ESIGN_TSA_URL") or None
+    if tsa_url:
+        _https_url(tsa_url, "ESIGN_TSA_URL")
+    tsa_username = env.get("ESIGN_TSA_USERNAME") or None
+    tsa_password = env.get("ESIGN_TSA_PASSWORD") or None
+    if bool(tsa_username) != bool(tsa_password):
+        raise ConfigError("ESIGN_TSA_USERNAME and ESIGN_TSA_PASSWORD must both be set or both omitted.")
+
     return Settings(
         host=host,
         port=_int(env, "ESIGN_PORT", defaults.port, 1, 65535),
@@ -91,4 +131,11 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         max_revisions=_int(env, "ESIGN_MAX_REVISIONS", defaults.max_revisions, 1, 10000),
         max_in_flight=_int(env, "ESIGN_MAX_IN_FLIGHT", defaults.max_in_flight, 1, 16),
         body_timeout_s=_int(env, "ESIGN_BODY_TIMEOUT_S", int(defaults.body_timeout_s), 1, 3600),
+        trust_roots_path=env.get("ESIGN_TRUST_ROOTS") or None,
+        intermediates_path=env.get("ESIGN_INTERMEDIATE_CERTS") or None,
+        crl_urls=crl_urls,
+        tsa_url=tsa_url,
+        tsa_username=tsa_username,
+        tsa_password=tsa_password,
+        tsa_trust_roots_path=env.get("ESIGN_TSA_TRUST_ROOTS") or None,
     )

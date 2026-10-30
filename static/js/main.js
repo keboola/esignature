@@ -1,7 +1,7 @@
 // Editor controller: panel steps, placement interactions and signing.
 // Untrusted text (file names, certificate fields, server messages) is only ever set via textContent.
 
-import { checkCertificate, signDocument, validateDocument } from "./api.js";
+import { checkCertificate, getCapabilities, signDocument, validateDocument } from "./api.js";
 import {
   BOX,
   addSignature,
@@ -32,6 +32,11 @@ const els = {
   docNotice: $("doc-notice"),
   validate: $("validate"),
   validationResults: $("validation-results"),
+  onlineRevocation: $("online-revocation"),
+  trustSetup: $("trust-setup"),
+  revocationSetup: $("revocation-setup"),
+  timestampSetup: $("timestamp-setup"),
+  optTimestamp: $("opt-timestamp"),
   p12Input: $("p12-input"),
   p12Name: $("p12-name"),
   password: $("password"),
@@ -682,7 +687,7 @@ async function validate() {
   els.validationResults.textContent = "Checking signatures…";
   render();
   try {
-    const result = await validateDocument(app.pdf);
+    const result = await validateDocument(app.pdf, els.onlineRevocation.checked);
     if (seq !== app.validationSeq) return;
     const container = els.validationResults;
     container.replaceChildren();
@@ -708,11 +713,27 @@ async function validate() {
       add(item, `Signed bytes integrity: ${status(signature.integrity, { valid: "Intact", invalid: "Broken", unknown: "Unknown" })}`);
       add(item, `Cryptographic signature: ${status(signature.cryptography, { valid: "Valid", invalid: "Invalid", unknown: "Unknown" })}`);
       add(item, `Changes after signing: ${status(signature.modifications, { allowed: "Allowed", disallowed: "Disallowed", unknown: "Unknown" })}`);
+      const report = (label, info) => {
+        if (!info) return;
+        const labels = { trusted: "Trusted", untrusted: "Untrusted", good: "Good", revoked: "Revoked",
+          valid: "Valid", invalid: "Invalid", absent: "Absent", unknown: "Unknown", not_checked: "Not checked" };
+        add(item, `${label}: ${status(info.status, labels)}`);
+        if (info.checked_at) add(item, `Checked at: ${info.checked_at}`);
+        if (info.message) add(item, info.message);
+      };
+      report("Certificate chain", signature.certificate_trust);
+      report("Certificate revocation", signature.revocation);
+      report("Timestamp", signature.timestamp);
+      if (signature.timestamp?.time) add(item, `Timestamp time: ${signature.timestamp.time}`);
+      report("Timestamp certificate chain", signature.timestamp?.certificate_trust);
+      report("Timestamp certificate revocation", signature.timestamp?.revocation);
       if (signature.error) add(item, signature.error, "error");
       container.append(item);
     }
     if (result.blocking_reason?.message) add(container, result.blocking_reason.message, "warning");
-    add(container, "Certificate trust and revocation were not checked.");
+    if (!result.signatures.some((signature) => signature.certificate_trust || signature.revocation)) {
+      add(container, "Certificate trust and revocation were not checked.");
+    }
   } catch (error) {
     if (seq !== app.validationSeq) return;
     els.validationResults.textContent = error.message;
@@ -745,6 +766,7 @@ async function sign() {
       placements: placementsPayload(state).filter((p) => !app.signedMode || p.type === "signature"),
       lock: els.optLock.checked,
       protocol: els.optProtocol.checked && !app.signedMode,
+      timestamp: els.optTimestamp.checked,
     });
     if (seq !== app.signSeq) {
       app.staleNotice = "The document or settings changed while signing. Sign again to get an up-to-date file.";
@@ -789,6 +811,13 @@ els.pdfInput.addEventListener("change", () => {
 });
 els.emptyChoose.addEventListener("click", () => els.pdfInput.click());
 els.validate.addEventListener("click", validate);
+els.onlineRevocation.addEventListener("change", () => {
+  app.validationSeq += 1;
+  app.validating = false;
+  els.validationResults.replaceChildren();
+  els.validationResults.hidden = true;
+  render();
+});
 
 els.viewer.addEventListener("dragover", (event) => {
   if ([...(event.dataTransfer?.types || [])].includes("Files")) {
@@ -840,6 +869,7 @@ for (const [input, key] of [[els.initialsMx, "mx"], [els.initialsMy, "my"]]) {
 }
 els.optLock.addEventListener("change", changed);
 els.optProtocol.addEventListener("change", changed);
+els.optTimestamp.addEventListener("change", changed);
 els.sign.addEventListener("click", sign);
 
 // Fit to width follows the window size until the user picks a zoom level.
@@ -864,5 +894,18 @@ new ResizeObserver(() => {
 
 window.addEventListener("dragover", (event) => event.preventDefault());
 window.addEventListener("drop", (event) => event.preventDefault());
+
+getCapabilities().then((capabilities) => {
+  els.trustSetup.textContent = capabilities.trust_configured
+    ? "Certificate chains are checked against configured roots at the current time."
+    : "Configure trust roots to check certificate chains.";
+  els.onlineRevocation.disabled = !capabilities.revocation_configured;
+  els.revocationSetup.hidden = capabilities.revocation_configured;
+  els.optTimestamp.disabled = !capabilities.timestamp_configured;
+  els.timestampSetup.hidden = capabilities.timestamp_configured;
+}).catch(() => {
+  els.trustSetup.textContent = "Configuration is unavailable. Reload the page to try again.";
+  els.revocationSetup.hidden = false;
+});
 
 render();

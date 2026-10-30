@@ -443,6 +443,7 @@ name = "esignature"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "pillow" },
@@ -463,6 +464,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.9,<3.15" },
     { name = "cryptography", specifier = ">=41.0.0" },
     { name = "fastapi", specifier = ">=0.162.0" },
     { name = "pillow", specifier = ">=10.0.0" },

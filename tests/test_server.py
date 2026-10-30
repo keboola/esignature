@@ -18,6 +18,7 @@ from pyhanko.sign.fields import MDPPerm
 from starlette.formparsers import MultiPartParser
 
 import server
+from certificate_validation import ValidationPolicy
 from config import Settings
 from tests.conftest import assert_all_signatures_ok, make_identity, make_pdf
 from tests.signed_fixtures import (
@@ -79,6 +80,60 @@ def sign_form(identity, pdf=None, placements=(SIGNATURE,), password=None, **fiel
 def validation_response(client, pdf, **kwargs):
     return client.post("/api/validate", headers=auth(client),
                        files={"pdf": ("document.pdf", pdf, "application/pdf")}, **kwargs)
+
+
+def test_online_capabilities_default_off_and_requests_fail_closed(client, secret_identity):
+    response = client.get("/api/capabilities")
+    assert response.json() == {"trust_configured": False, "revocation_configured": False,
+                               "timestamp_configured": False}
+    assert response.headers["cache-control"] == "no-store"
+    response = validation_response(client, make_pdf(), data={"online_revocation": "true"})
+    assert response.status_code == 400
+    assert "not configured" in response.json()["error"]
+    response = client.post("/api/sign", headers=auth(client), **sign_form(secret_identity, timestamp="true"))
+    assert response.status_code == 400
+    assert "not configured" in response.json()["error"]
+
+
+def test_capabilities_and_options_use_only_server_configuration(monkeypatch, secret_identity):
+    policy = ValidationPolicy(trust_roots=(object(),), crl_urls=("https://crl.example/issuer",))
+    monkeypatch.setattr(server, "load_validation_policy", lambda **kwargs: policy)
+    captured = {}
+
+    def validate(pdf, **kwargs):
+        captured["validation"] = kwargs
+        return {"signed": False, "signature_count": 0, "signatures": []}
+
+    def sign(pdf, p12, password, placements, **kwargs):
+        captured["signing"] = kwargs
+        return pdf
+
+    monkeypatch.setattr(server, "validate_pdf_document", validate)
+    monkeypatch.setattr(server, "sign_pdf_multiple", sign)
+    settings = replace(SETTINGS, tsa_url="https://tsa.example/secret-path",
+                       tsa_username="private-user", tsa_password="private-password")
+    with TestClient(make_app(settings), base_url=BASE) as http:
+        caps = http.get("/api/capabilities")
+        assert caps.json() == {"trust_configured": True, "revocation_configured": True,
+                               "timestamp_configured": True}
+        assert "private" not in caps.text and "secret-path" not in caps.text
+        response = validation_response(http, make_pdf(), data={"online_revocation": "true"})
+        assert response.status_code == 200
+        assert captured["validation"]["validation_policy"] is policy
+        assert captured["validation"]["online_revocation"] is True
+        response = http.post("/api/sign", headers=auth(http), **sign_form(secret_identity, timestamp="true"))
+        assert response.status_code == 200
+        tsa = captured["signing"]["timestamp_config"]
+        assert tsa.url == settings.tsa_url and tsa.validation_policy is policy
+        assert tsa.username == settings.tsa_username and tsa.password == settings.tsa_password
+        response = http.post("/api/sign", headers=auth(http), **sign_form(secret_identity))
+        assert response.status_code == 200
+        assert captured["signing"]["timestamp_config"] is None
+
+
+def test_unrecognized_browser_service_url_is_rejected(client):
+    response = validation_response(client, make_pdf(), data={"crl_url": "https://example.test"})
+    assert response.status_code == 400
 
 
 def test_validate_unsigned_pdf_needs_no_certificate(client):
