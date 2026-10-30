@@ -1,7 +1,7 @@
 // Editor controller: panel steps, placement interactions and signing.
 // Untrusted text (file names, certificate fields, server messages) is only ever set via textContent.
 
-import { checkCertificate, signDocument } from "./api.js";
+import { checkCertificate, signDocument, validateDocument } from "./api.js";
 import {
   BOX,
   addSignature,
@@ -30,6 +30,8 @@ const els = {
   pdfName: $("pdf-name"),
   docInfo: $("doc-info"),
   docNotice: $("doc-notice"),
+  validate: $("validate"),
+  validationResults: $("validation-results"),
   p12Input: $("p12-input"),
   p12Name: $("p12-name"),
   password: $("password"),
@@ -78,6 +80,8 @@ const app = {
   docSeq: 0,
   signSeq: 0,
   signing: false,
+  validating: false,
+  validationSeq: 0,
   placing: false,
   resultUrl: null,
   drag: null,
@@ -133,6 +137,10 @@ function resetInitials() {
 // --- Document ------------------------------------------------------------------------------------
 
 function resetDocumentPolicy() {
+  app.validationSeq += 1;
+  app.validating = false;
+  els.validationResults.replaceChildren();
+  els.validationResults.hidden = true;
   app.signatureFields = [];
   app.signaturesHint = false;
   app.signedMode = false;
@@ -632,6 +640,8 @@ function signBlocker(initials) {
 
 function render() {
   const hasDoc = state.pageSizes.length > 0;
+  els.validate.disabled = !app.pdf || app.validating;
+  els.validate.textContent = app.validating ? "Validating…" : "Validate signatures";
   els.addSignature.disabled = !hasDoc;
   els.zoomIn.disabled = els.zoomOut.disabled = els.zoomLabel.disabled = !hasDoc;
   els.zoomLabel.textContent = `${Math.round(viewer.scale * 100)}%`;
@@ -660,6 +670,58 @@ function render() {
   if (app.signing) hint = app.signSeq === app.signingSeq ? "" : "Inputs changed; this result will be discarded.";
   else if (app.staleNotice) hint = app.staleNotice;
   els.signHint.textContent = hint;
+}
+
+// Validation concerns only the selected PDF, and never needs a P12. Discard a response if
+// another document was opened while the local server was working.
+async function validate() {
+  if (!app.pdf || app.validating) return;
+  const seq = ++app.validationSeq;
+  app.validating = true;
+  els.validationResults.hidden = false;
+  els.validationResults.textContent = "Checking signatures…";
+  render();
+  try {
+    const result = await validateDocument(app.pdf);
+    if (seq !== app.validationSeq) return;
+    const container = els.validationResults;
+    container.replaceChildren();
+    const add = (parent, text, className = "") => {
+      const p = document.createElement("p");
+      p.textContent = text;
+      if (className) p.className = className;
+      parent.append(p);
+    };
+    add(container, result.signed === null || (result.signed === false && result.blocking_reason)
+      ? "Could not determine whether this document is signed."
+      : result.signed
+        ? result.signature_count === 0
+          ? "Earlier signature history detected."
+          : `${result.signature_count} signature${result.signature_count === 1 ? "" : "s"} found.`
+        : "No signatures found.", "validation-heading");
+    for (const [index, signature] of result.signatures.entries()) {
+      const item = document.createElement("div");
+      item.className = "validation-signature";
+      add(item, signature.signer || signature.field_name || `Signature ${index + 1}`, "validation-heading");
+      if (signature.field_name) add(item, `Field: ${signature.field_name}`);
+      const status = (value, labels) => labels[value] || "Unknown";
+      add(item, `Signed bytes integrity: ${status(signature.integrity, { valid: "Intact", invalid: "Broken", unknown: "Unknown" })}`);
+      add(item, `Cryptographic signature: ${status(signature.cryptography, { valid: "Valid", invalid: "Invalid", unknown: "Unknown" })}`);
+      add(item, `Changes after signing: ${status(signature.modifications, { allowed: "Allowed", disallowed: "Disallowed", unknown: "Unknown" })}`);
+      if (signature.error) add(item, signature.error, "error");
+      container.append(item);
+    }
+    if (result.blocking_reason?.message) add(container, result.blocking_reason.message, "warning");
+    add(container, "Certificate trust and revocation were not checked.");
+  } catch (error) {
+    if (seq !== app.validationSeq) return;
+    els.validationResults.textContent = error.message;
+  } finally {
+    if (seq === app.validationSeq) {
+      app.validating = false;
+      render();
+    }
+  }
 }
 
 // --- Signing -------------------------------------------------------------------------------------
@@ -726,6 +788,7 @@ els.pdfInput.addEventListener("change", () => {
   openPdf(file);
 });
 els.emptyChoose.addEventListener("click", () => els.pdfInput.click());
+els.validate.addEventListener("click", validate);
 
 els.viewer.addEventListener("dragover", (event) => {
   if ([...(event.dataTransfer?.types || [])].includes("Files")) {

@@ -81,6 +81,7 @@ __all__ = [
     "sanitize_signer_name",
     "format_page_ranges",
     "sign_pdf_multiple",
+    "validate_pdf_document",
 ]
 
 
@@ -883,6 +884,89 @@ def _has_signature_permissions(root: Any) -> bool:
         key in perms for key in ("/DocMDP", "/UR3", "/UR"))
 
 
+def _linearized_document_length(reader: PdfFileReader) -> Optional[int]:
+    """Recognise the TWO xref sections of the first linearized physical revision.
+
+    pyHanko exposes the main xref as revision 0 and the first-page xref as revision 1.
+    Revision 0 alone is incomplete, and a signature stored there really signs revision 1.
+    A marker alone is insufficient: the original length, EOF pointer, physical section order,
+    main-xref hint and disjoint object definitions must agree. Later revisions are never skipped.
+    """
+    if reader.total_revisions < 2:
+        return None
+    main = reader.xrefs.get_xref_container_info(0)
+    first = reader.xrefs.get_xref_container_info(1)
+    if not 0 < first.start_location < first.end_location < main.start_location:
+        return None
+    stream = reader.stream
+    position = stream.tell()
+    try:
+        stream.seek(0)
+        head = stream.read(1024)
+        # Only the first indirect object may be the linearization dictionary.
+        match = re.match(rb"%PDF-[^\r\n]+[\r\n]+(?:%[^\r\n]*[\r\n]+|\s)*\d+\s+\d+\s+obj\s*", head)
+        if match is None:
+            return None
+        stream.seek(match.end())
+        linear = generic.read_object(stream, generic.TrailerReference(reader))
+        if not isinstance(linear, generic.DictionaryObject) or linear.get("/Linearized") != 1:
+            return None
+        length, end_first, main_hint = (linear.get(key) for key in ("/L", "/E", "/T"))
+        if not all(isinstance(v, generic.NumberObject) for v in (length, end_first, main_hint)):
+            return None
+        length, end_first, main_hint = int(length), int(end_first), int(main_hint)
+        stream.seek(0, io.SEEK_END)
+        if not main.end_location < length <= stream.tell():
+            return None
+        if not first.end_location < end_first <= main.start_location:
+            return None
+        if not main.declared_startxref - 1 <= main_hint < main.end_location:
+            return None
+        stream.seek(max(0, length - 128))
+        eof = stream.read(min(length, 128))
+        tail = re.search(rb"startxref\s+(\d+)\s+%%EOF\s*\Z", eof)
+        if tail is None or int(tail.group(1)) != first.declared_startxref:
+            return None
+        # A genuine incremental overwrite cannot masquerade as the two disjoint halves.
+        main_refs = reader.xrefs.explicit_refs_in_revision(0)
+        first_refs = reader.xrefs.explicit_refs_in_revision(1)
+        if main_refs & first_refs:
+            return None
+        # Both halves must describe the SAME catalog, supplied only by the first-page half.
+        # Otherwise a forged pair could hide a complete older document under a new trailer root.
+        main_root = reader.trailer.flatten(0).raw_get("/Root")
+        first_root = reader.trailer.flatten(1).raw_get("/Root")
+        if not all(isinstance(root, generic.IndirectObject) for root in (main_root, first_root)):
+            return None
+        root_ref = main_root.reference
+        if root_ref != first_root.reference or root_ref not in first_refs:
+            return None
+        if reader.xrefs.get_historical_ref(root_ref, 0) is not None:
+            return None
+        return length
+    except (KeyError, ValueError, TypeError, PdfError):
+        return None
+    finally:
+        stream.seek(position)
+
+
+def _document_revisions(reader: PdfFileReader) -> range:
+    """Complete logical revisions; keep both xrefs available to the resolver and diff policy."""
+    return range(1 if _linearized_document_length(reader) is not None else 0, reader.total_revisions)
+
+
+def _normalise_linearized_signatures(reader: PdfFileReader) -> None:
+    length = _linearized_document_length(reader)
+    if length is None:
+        return
+    for sig in reader.embedded_signatures:
+        byte_range = _byte_range(sig)
+        if (sig.signed_revision == 0 and len(byte_range) == 4 and byte_range[0] == 0
+                and byte_range[2] + byte_range[3] == length):
+            # Only the index changes. Coverage, CMS integrity and DEFAULT diff analysis still run.
+            sig.signed_revision = 1
+
+
 def _signed_in_any_revision(reader: PdfFileReader) -> bool:
     """True if the current or any earlier revision holds a signature, by any of:
     a filled /Sig field in the form tree or among page widgets (names optional), a catalog
@@ -893,7 +977,7 @@ def _signed_in_any_revision(reader: PdfFileReader) -> bool:
             return True
     except Exception:  # noqa: BLE001 - unreadable signature data is still signature data
         return True
-    for revision in range(reader.total_revisions):
+    for revision in _document_revisions(reader):
         resolver = reader.get_historical_resolver(revision)
         if _has_signature_permissions(resolver.root) or _filled_signature_holders(resolver):
             return True
@@ -903,7 +987,7 @@ def _signed_in_any_revision(reader: PdfFileReader) -> bool:
 def _check_all_signatures_checkable(reader: PdfFileReader) -> None:
     """Refuse signatures the name-based checks cannot see (e.g. fields without /T, or widgets
     missing from /Fields): every filled /Sig holder must be one pyHanko enumerates by name."""
-    for revision in range(reader.total_revisions):
+    for revision in _document_revisions(reader):
         resolver = reader.get_historical_resolver(revision)
         named = {
             ("ref", ref.idnum, ref.generation)
@@ -935,7 +1019,7 @@ def _classify_input(original: bytes, max_revisions: int) -> InputClassification:
             raise PdfInputError(MSG_DAMAGED_SIGNED, code=CODE_INVALID_EXISTING) from e
         return InputClassification(signed=False, reader=None)
 
-    _check_revision_count(reader.total_revisions, max_revisions)
+    _check_revision_count(len(_document_revisions(reader)), max_revisions)
     try:
         _acroform_field_names(reader)
         signed = _signed_in_any_revision(reader)
@@ -967,7 +1051,7 @@ def _historical_signature_identities(reader: PdfFileReader) -> Set[ExistingSigna
     shows up here but not among the current signatures.
     """
     identities: Set[ExistingSignature] = set()
-    for revision in range(reader.total_revisions):
+    for revision in _document_revisions(reader):
         resolver = reader.get_historical_resolver(revision)
         for name, value, _ in fields.enumerate_sig_fields(resolver, filled_status=True):
             byte_range = _deref(_deref(value).get("/ByteRange"))
@@ -977,6 +1061,16 @@ def _historical_signature_identities(reader: PdfFileReader) -> Set[ExistingSigna
     return identities
 
 
+def _signature_status(sig: Any) -> Tuple[Any, Dict[str, Any]]:
+    """Offline cryptographic/integrity checks; certificate trust is not a verdict here."""
+    context = ValidationContext(trust_roots=[], allow_fetching=False)
+    if sig.sig_object_type == "/DocTimeStamp":
+        status = validate_pdf_timestamp(sig, context)
+    else:
+        status = validate_pdf_signature(sig, context)
+    return status, sig.summarise_integrity_info()
+
+
 def _signature_preserved(sig: Any) -> bool:
     """True if ``sig`` is intact, cryptographically valid and its later changes are permitted.
 
@@ -984,13 +1078,87 @@ def _signature_preserved(sig: Any) -> bool:
     cannot make a stranger's certificate trusted, only keep the signature unbroken.
     Validation errors propagate; callers decide how to fail closed.
     """
-    context = ValidationContext(trust_roots=[], allow_fetching=False)
-    if sig.sig_object_type == "/DocTimeStamp":
-        status = validate_pdf_timestamp(sig, context)
-    else:
-        status = validate_pdf_signature(sig, context)
-    docmdp_ok = sig.summarise_integrity_info()["docmdp_ok"]
-    return bool(status.intact and status.valid and docmdp_ok)
+    status, integrity = _signature_status(sig)
+    return bool(status.intact and status.valid and integrity["docmdp_ok"])
+
+
+def validate_pdf_document(
+    pdf_bytes: bytes,
+    max_existing_signatures: int = DEFAULT_MAX_EXISTING_SIGNATURES,
+    max_revisions: int = DEFAULT_MAX_REVISIONS,
+) -> Dict[str, Any]:
+    """Inspect ORIGINAL PDF bytes locally without a signing key or document rewriting.
+
+    Report byte integrity, mathematical signature validity and permitted changes separately.
+    Neither embedded certificates nor self-signed certificates are treated as trusted roots.
+    No online trust, revocation, qualified-signature or legal-validity assertion is made.
+    """
+    doc = _open_input_document(pdf_bytes)
+    doc.close()
+    result: Dict[str, Any] = {
+        "signed": None,
+        "signature_count": 0,
+        "signatures": [],
+        "can_countersign": False,
+        "blocking_reason": None,
+        "trust": {"status": "not_checked", "message": "Certificate trust chains are not checked."},
+        "revocation": {
+            "status": "not_checked", "message": "Certificate revocation is not checked (offline).",
+        },
+    }
+
+    def blocked(error: PdfInputError) -> Dict[str, Any]:
+        result["blocking_reason"] = {"code": error.code or "invalid_pdf", "message": str(error)}
+        return result
+
+    try:
+        classification = _classify_input(pdf_bytes, max_revisions)
+    except PdfInputError as e:
+        return blocked(e)
+    result["signed"] = classification.signed
+    if classification.reader is None:
+        # The signing path may repair an unsigned PDF; inspection cannot validate a repaired copy.
+        return blocked(PdfInputError("The PDF needs repair before its signatures can be inspected."))
+    reader = classification.reader
+    try:
+        filled = list(fields.enumerate_sig_fields(reader, filled_status=True))
+        result["signature_count"] = len(filled)
+        if len(filled) > max_existing_signatures:
+            raise PdfInputError(
+                f"The document has too many signatures to check (limit {max_existing_signatures}).",
+                code=CODE_TOO_MANY_SIGNATURES,
+            )
+        _normalise_linearized_signatures(reader)
+        for sig in reader.embedded_signatures:
+            signer_name = sig.signer_cert.subject.native.get("common_name") or "Unknown"
+            entry = {
+                "field_name": sanitize_signer_name(sig.field_name),
+                "signer": sanitize_signer_name(signer_name),
+                "integrity": "unknown", "cryptography": "unknown", "modifications": "unknown",
+                "coverage": None, "modification_level": None,
+            }
+            try:
+                status, integrity = _signature_status(sig)
+                entry.update({
+                    "integrity": "valid" if status.intact else "invalid",
+                    "cryptography": "valid" if status.valid else "invalid",
+                    "modifications": {True: "allowed", False: "disallowed"}.get(
+                        integrity["docmdp_ok"], "unknown"),
+                    "coverage": getattr(status.coverage, "name", None),
+                    "modification_level": getattr(status.modification_level, "name", None),
+                })
+            except Exception:  # noqa: BLE001 - unsupported CMS/algorithms produce an honest unknown
+                entry["error"] = "This signature could not be checked."
+            result["signatures"].append(entry)
+        if classification.signed:
+            names = _signature_field_names(1, _acroform_field_names(reader))
+            _check_existing_signatures(reader, names, max_existing_signatures)
+        result["can_countersign"] = True
+    except PdfInputError as e:
+        return blocked(e)
+    except Exception:  # noqa: BLE001 - unreadable signature structures are not unsigned input
+        return blocked(PdfInputError(MSG_UNSUPPORTED_SIGNATURE, code=CODE_INVALID_EXISTING))
+    return result
 
 
 def _check_existing_signatures(
@@ -1018,6 +1186,7 @@ def _check_existing_signatures(
         )
     try:
         # Parses every signature's CMS blob; an unreadable one must be a clear refusal.
+        _normalise_linearized_signatures(reader)
         embedded = reader.embedded_signatures
         current = {ExistingSignature(sig.field_name, _byte_range(sig)) for sig in embedded}
         historical = _historical_signature_identities(reader)
@@ -1070,6 +1239,7 @@ def _post_check(
         raise SigningError(MSG_BROKE_EXISTING)
     try:
         reader = PdfFileReader(io.BytesIO(output), strict=False)
+        _normalise_linearized_signatures(reader)
         by_name = {sig.field_name: sig for sig in reader.embedded_signatures}
         for identity in existing:
             sig = by_name.get(identity.name)

@@ -54,6 +54,13 @@ export async function checkCertificate(p12, password) {
   return (await post("/api/certificate", form)).json();
 }
 
+/** Check signatures in the selected PDF without a signing certificate. */
+export async function validateDocument(pdf) {
+  const form = new FormData();
+  form.append("pdf", ...part(pdf, "application/pdf"));
+  return (await post("/api/validate", form)).json();
+}
+
 /** Returns the signed PDF as a Blob. */
 export async function signDocument({ pdf, p12, password, placements, lock, protocol }) {
   const form = new FormData();

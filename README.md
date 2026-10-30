@@ -28,6 +28,9 @@ and initials on the pages, and a signer that adds cryptographically valid PDF si
   (enforcement depends on the PDF viewer).
 - **Counter-signing** – add your signature to a contract the other party already signed; their
   signature stays valid (see [Counter-signing signed PDFs](#counter-signing-signed-pdfs)).
+- **Validate signatures** – check the integrity, cryptographic validity and subsequent changes
+  for each existing signature without selecting a certificate. Certificate trust and revocation
+  are not checked.
 
 ## Run it
 
@@ -62,6 +65,8 @@ app at startup with a message naming the variable.
 
 1. **Document** – choose a PDF (or drop it onto the page area). It is read once and opened in
    the browser; signing uses exactly those bytes, even if the file changes on disk later.
+   Optionally click **Validate signatures** to check the selected PDF using the local server;
+   no signing certificate is needed. The result does not establish certificate trust or revocation.
 2. **Certificate** – choose your `.p12`/`.pfx` file and type its password (leave it empty if the
    certificate has none). The app checks it and shows the name, issuer and validity.
 3. **Options** – add a protocol page and/or lock the PDF.

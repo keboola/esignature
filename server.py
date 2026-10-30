@@ -46,6 +46,7 @@ from signer import (
     sanitize_signer_name,
     sign_pdf_multiple,
     validate_certificate,
+    validate_pdf_document,
 )
 
 logger = logging.getLogger("esignature")
@@ -455,6 +456,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         return await run_admitted(
             request, {"pdf", "p12"}, {"password", "placements", "lock", "protocol"}, prepare)
+
+    @app.post("/api/validate")
+    async def validate(request: Request) -> Response:
+        def prepare(form: Dict[str, Any]) -> Callable[[], Response]:
+            pdf = require(form, "pdf")
+            check_size(pdf, settings.max_pdf_bytes, "PDF")
+            return lambda: JSONResponse(validate_pdf_document(
+                pdf,
+                max_existing_signatures=settings.max_existing_signatures,
+                max_revisions=settings.max_revisions,
+            ))
+
+        return await run_admitted(request, {"pdf"}, set(), prepare)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")

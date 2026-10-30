@@ -20,7 +20,14 @@ from starlette.formparsers import MultiPartParser
 import server
 from config import Settings
 from tests.conftest import assert_all_signatures_ok, make_identity, make_pdf
-from tests.signed_fixtures import corrupt_signature_contents, sign_as, with_revisions
+from tests.signed_fixtures import (
+    TestTsa,
+    corrupt_signature_contents,
+    edit_page_content_after,
+    sign_as,
+    signed_linearized_layout,
+    with_revisions,
+)
 
 BASE = "http://127.0.0.1:8501"
 ORIGIN = BASE
@@ -67,6 +74,75 @@ def sign_form(identity, pdf=None, placements=(SIGNATURE,), password=None, **fiel
         **fields,
     }
     return {"files": files, "data": data}
+
+
+def validation_response(client, pdf, **kwargs):
+    return client.post("/api/validate", headers=auth(client),
+                       files={"pdf": ("document.pdf", pdf, "application/pdf")}, **kwargs)
+
+
+def test_validate_unsigned_pdf_needs_no_certificate(client):
+    response = validation_response(client, make_pdf())
+    assert response.status_code == 200
+    report = response.json()
+    assert report["signed"] is False
+    assert report["signature_count"] == 0
+    assert report["signatures"] == []
+    assert report["can_countersign"]
+    assert report["trust"]["status"] == report["revocation"]["status"] == "not_checked"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_validate_separates_self_signed_crypto_from_trust(client, secret_identity):
+    signed = signed_linearized_layout(secret_identity)
+    response = validation_response(client, signed)
+    assert response.status_code == 200
+    report = response.json()
+    assert report["signed"] and report["signature_count"] == 1
+    assert report["can_countersign"] and report["blocking_reason"] is None
+    signature = report["signatures"][0]
+    assert signature["signer"] == "Petra Svobodová"
+    assert signature["integrity"] == signature["cryptography"] == "valid"
+    assert signature["modifications"] == "allowed"
+    assert report["trust"]["status"] == report["revocation"]["status"] == "not_checked"
+
+
+def test_validate_reports_disallowed_changes_separately(client, secret_identity):
+    changed = edit_page_content_after(sign_as(make_pdf(text="Original"), secret_identity))
+    report = validation_response(client, changed).json()
+    assert not report["can_countersign"]
+    assert report["signatures"][0]["integrity"] == "valid"
+    assert report["signatures"][0]["cryptography"] == "valid"
+    assert report["signatures"][0]["modifications"] == "disallowed"
+    assert report["blocking_reason"]["code"] == "invalid_existing_signatures"
+
+
+def test_validate_preserves_lock_policy_and_timestamp_reporting(client, secret_identity):
+    locked = sign_as(make_pdf(), secret_identity, lock=MDPPerm.NO_CHANGES)
+    report = validation_response(client, locked).json()
+    assert not report["can_countersign"]
+    assert report["signatures"][0]["cryptography"] == "valid"
+    assert report["blocking_reason"]["code"] == "locked_document"
+    timestamped = TestTsa().timestamp(make_pdf())
+    report = validation_response(client, timestamped).json()
+    assert report["signed"] and report["signature_count"] == 1
+    assert report["signatures"][0]["integrity"] == "valid"
+    assert report["signatures"][0]["cryptography"] == "valid"
+
+
+def test_validate_malformed_cms_is_not_reported_unsigned(client, secret_identity):
+    corrupt = corrupt_signature_contents(sign_as(make_pdf(), secret_identity))
+    report = validation_response(client, corrupt).json()
+    assert report["signed"] is True
+    assert not report["can_countersign"]
+    assert report["blocking_reason"]["code"] == "invalid_existing_signatures"
+
+
+def test_validate_uses_origin_token_and_upload_limits(client):
+    assert client.post("/api/validate").status_code == 403
+    assert validation_response(client, b"not a PDF").status_code == 400
+    assert validation_response(client, b"x" * (SETTINGS.max_pdf_bytes + 1)).status_code == 413
+    assert client.post("/api/validate", headers=auth(client), data={"pdf": "not a file"}).status_code == 400
 
 
 # --- Static frontend and headers --------------------------------------------------------------

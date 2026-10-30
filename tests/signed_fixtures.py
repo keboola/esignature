@@ -5,8 +5,10 @@ tests then counter-sign as party B through ``sign_pdf_multiple``. Negative contr
 A's revision history the way a careless or malicious tool would.
 """
 
+import asyncio
 import contextlib
 import datetime
+import hashlib
 import io
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -323,6 +325,66 @@ def corrupt_signature_contents(signed: bytes) -> bytes:
     """Overwrite the first bytes of A's CMS blob (/Contents hex), keeping every offset."""
     start = signed.index(b"/Contents <") + len(b"/Contents <")
     return signed[:start] + b"ffff" + signed[start + 4:]
+
+
+def signed_linearized_layout(identity: Identity, hidden_complete_main: bool = False) -> bytes:
+    """Synthetic signed initial document with disjoint first-page/main xref sections.
+
+    Like linearized PDFs, the early first-page xref points forward through /Prev to the
+    main xref at EOF. The signature lives in the main section, the catalog in the early one.
+    Fixed-width placeholders let us sign the initial layout without rewriting a signed PDF.
+    No private/user document data is used.
+    """
+    output = io.BytesIO()
+    offsets = {}
+    output.write(b"%PDF-1.7\n")
+
+    def obj(number, body):
+        offsets[number] = output.tell()
+        output.write(b"%d 0 obj\n" % number + body + b"\nendobj\n")
+
+    def num(value):
+        return b"%010d" % value
+
+    obj(1, b"<< /Linearized 1 /L LLLLLLLLLL /E EEEEEEEEEE /T TTTTTTTTTT /O 2 /N 1 /H [0 0] >>")
+    early_xref = output.tell()
+    output.write(b"xref\n0 2\n0000000000 65535 f \n" + num(offsets[1]) + b" 00000 n \n")
+    output.write(b"10 2\nCCCCCCCCCC 00000 n \nPPPPPPPPPP 00000 n \n")
+    output.write(b"trailer\n<< /Size 12 /Root 10 0 R /Prev MMMMMMMMMM >>\nstartxref\n0\n%%EOF\n")
+    current_fields = b"[]" if hidden_complete_main else b"[3 0 R]"
+    obj(10, b"<< /Type /Catalog /Pages 11 0 R /AcroForm << /Fields " + current_fields + b" /SigFlags 3 >> >>")
+    obj(11, b"<< /Type /Pages /Kids [2 0 R] /Count 1 >>")
+    end_first = output.tell()
+    obj(2, b"<< /Type /Page /Parent 11 0 R /MediaBox [0 0 595 842] "
+           b"/Resources << >> /Contents 5 0 R /Annots [3 0 R] >>")
+    obj(3, b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (A) /V 4 0 R /Rect [300 600 450 650] /P 2 0 R >>")
+    obj(4, b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached "
+        b"/ByteRange [0000000000 0000000000 0000000000 0000000000] /Contents <" + b"0" * 32768 + b"> >>")
+    obj(5, b"<< /Length 0 >>\nstream\n\nendstream")
+    if hidden_complete_main:
+        # Hostile layout: the main xref is a complete older graph with A, while the
+        # first-page trailer installs a disjoint new catalog that hides A.
+        obj(6, b"<< /Type /Catalog /Pages 11 0 R /AcroForm << /Fields [3 0 R] /SigFlags 3 >> >>")
+    main_xref = output.tell()
+    output.write(b"xref\n2 5\n" if hidden_complete_main else b"xref\n2 4\n")
+    for number in range(2, 7 if hidden_complete_main else 6):
+        output.write(num(offsets[number]) + b" 00000 n \n")
+    root = b"6" if hidden_complete_main else b"10"
+    output.write(b"trailer\n<< /Size 12 /Root " + root + b" 0 R >>\nstartxref\n"
+                 + str(early_xref).encode() + b"\n%%EOF\n")
+    pdf = output.getvalue()
+    for placeholder, value in ((b"LLLLLLLLLL", len(pdf)), (b"EEEEEEEEEE", end_first),
+                               (b"TTTTTTTTTT", main_xref), (b"MMMMMMMMMM", main_xref),
+                               (b"CCCCCCCCCC", offsets[10]), (b"PPPPPPPPPP", offsets[11])):
+        pdf = pdf.replace(placeholder, num(value))
+    start = pdf.index(b"/Contents <") + len(b"/Contents ")
+    end = start + 32770
+    byte_range = b"[" + b" ".join(num(n) for n in (0, start, end, len(pdf) - end)) + b"]"
+    pdf = pdf.replace(b"[0000000000 0000000000 0000000000 0000000000]", byte_range)
+    digest = hashlib.sha256(pdf[:start] + pdf[end:]).digest()
+    cms = asyncio.run(_simple_signer(identity).async_sign(digest, "sha256")).dump().hex().encode()
+    assert len(cms) <= 32768
+    return pdf[:start + 1] + cms.ljust(32768, b"0") + pdf[end - 1:]
 
 
 # --- Assertions ------------------------------------------------------------------------------------

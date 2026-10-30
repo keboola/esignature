@@ -82,6 +82,84 @@ def canvas_ink(page: Page, index: int, rect) -> int:
     }""", [index, list(rect)])
 
 
+def test_validate_existing_signatures_without_certificate(page: Page, base_url, tmp_path, signed_by_a):
+    page.goto(base_url)
+    expect(page.locator("#validate")).to_be_disabled()
+    page.set_input_files("#pdf-input", write(tmp_path, "signed.pdf", signed_by_a))
+    expect(page.locator("#doc-info")).to_have_text("2 pages")
+    expect(page.locator("#validate")).to_be_enabled()
+    page.click("#validate")
+    results = page.locator("#validation-results")
+    expect(results).to_contain_text("1 signature found")
+    expect(results).to_contain_text("Alice Original")
+    expect(results).to_contain_text("Signed bytes integrity: Intact")
+    expect(results).to_contain_text("Cryptographic signature: Valid")
+    expect(results).to_contain_text("Changes after signing: Allowed")
+    expect(results).to_contain_text("Certificate trust and revocation were not checked")
+    page.set_input_files("#pdf-input", write(tmp_path, "unsigned.pdf", blank_pdf(1)))
+    expect(results).to_be_hidden()
+    expect(page.locator("#doc-info")).to_have_text("1 page")
+    page.click("#validate")
+    expect(results).to_contain_text("No signatures found")
+
+
+def test_stale_validation_does_not_replace_new_document_result(page: Page, base_url, tmp_path):
+    page.add_init_script("""
+      const fetchOriginal = window.fetch;
+      window.fetch = (url, options) => String(url).includes('/api/validate')
+        ? new Promise(resolve => { window.finishValidation = () => resolve(new Response(
+            JSON.stringify({signed: true, signature_count: 1, signatures: [
+              {field_name: 'Old document', integrity: 'invalid', cryptography: 'invalid',
+               modifications: 'unknown'}
+            ]}), {status: 200, headers: {'Content-Type': 'application/json'}})); })
+        : fetchOriginal(url, options);
+    """)
+    page.goto(base_url)
+    page.set_input_files("#pdf-input", write(tmp_path, "first.pdf", blank_pdf(1)))
+    expect(page.locator("#doc-info")).to_have_text("1 page")
+    page.click("#validate")
+    expect(page.locator("#validation-results")).to_contain_text("Checking signatures")
+    page.set_input_files("#pdf-input", write(tmp_path, "second.pdf", blank_pdf(2)))
+    expect(page.locator("#doc-info")).to_have_text("2 pages")
+    page.evaluate("window.finishValidation()")
+    expect(page.locator("#validation-results")).to_be_hidden()
+    expect(page.locator("#validate")).to_be_enabled()
+
+
+def test_validation_reports_invalid_and_unknown_as_distinct(page: Page, base_url, tmp_path):
+    page.route("**/api/validate", lambda route: route.fulfill(json={
+        "signed": True, "signature_count": 2,
+        "signatures": [
+            {"field_name": "<img src=x>", "signer": "Alice", "integrity": "invalid",
+             "cryptography": "invalid", "modifications": "disallowed"},
+            {"field_name": "Unsupported", "signer": "", "integrity": "unknown",
+             "cryptography": "unknown", "modifications": "unknown", "error": "Cannot check format"},
+        ],
+    }))
+    page.goto(base_url)
+    page.set_input_files("#pdf-input", write(tmp_path, "document.pdf", blank_pdf(1)))
+    expect(page.locator("#validate")).to_be_enabled()
+    page.click("#validate")
+    results = page.locator("#validation-results")
+    expect(results).to_contain_text("2 signatures found")
+    expect(results).to_contain_text("Signed bytes integrity: Broken")
+    expect(results).to_contain_text("Cryptographic signature: Invalid")
+    expect(results).to_contain_text("Changes after signing: Disallowed")
+    expect(results).to_contain_text("Cryptographic signature: Unknown")
+    expect(results).to_contain_text("Cannot check format")
+    expect(results).to_contain_text("<img src=x>")
+    expect(results.locator("img")).to_have_count(0)
+    page.unroute_all()
+    page.route("**/api/validate", lambda route: route.fulfill(json={
+        "signed": True, "signature_count": 0, "signatures": [],
+        "blocking_reason": {"message": "Earlier signature was removed."},
+    }))
+    page.click("#validate")
+    expect(results).to_contain_text("Earlier signature history detected")
+    expect(results).to_contain_text("Earlier signature was removed")
+    expect(results).not_to_contain_text("0 signatures found")
+
+
 # --- K12/K13/K19: first Sign switches to signed mode, the second one counter-signs ----------------
 
 def test_signed_pdf_switches_to_signed_mode_and_second_sign_keeps_both_valid(

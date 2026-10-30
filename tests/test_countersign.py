@@ -43,6 +43,7 @@ from tests.signed_fixtures import (
     replace_signature_in_same_field,
     rotate_page_after,
     sign_as,
+    signed_linearized_layout,
     unnamed_signature_fields,
     unsupported_subfilter,
     with_revisions,
@@ -698,3 +699,62 @@ def test_revision_cap_applies_to_unparsable_files_before_repair(party_b):
 def test_damaged_single_revision_pdf_still_repairs_within_the_cap(party_b):
     out = countersign(broken_startxref(make_pdf(text="hello")), party_b, max_revisions=1)
     assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
+
+
+def test_initial_linearized_signature_in_main_xref_is_preserved(party_a, party_b):
+    original = signed_linearized_layout(party_a)
+    reader = PdfFileReader(io.BytesIO(original), strict=False)
+    assert reader.total_revisions == 2
+    assert reader.embedded_signatures[0].signed_revision == 0
+    assert signer_module._linearized_document_length(reader) == len(original)
+
+    output = countersign(original, party_b, max_revisions=1)
+
+    assert output.startswith(original)
+    report = signer_module.validate_pdf_document(output)
+    assert report["can_countersign"]
+    assert len(report["signatures"]) == 2
+    assert all(s["integrity"] == s["cryptography"] == "valid" for s in report["signatures"])
+    assert all(s["modifications"] == "allowed" for s in report["signatures"])
+    # Independently inspect with the same default diff policy and explicit fixture trust roots.
+    parsed = PdfFileReader(io.BytesIO(output), strict=False)
+    signer_module._normalise_linearized_signatures(parsed)
+    from pyhanko.sign.validation import validate_pdf_signature
+    from pyhanko_certvalidator import ValidationContext
+    for embedded in parsed.embedded_signatures:
+        status = validate_pdf_signature(embedded, ValidationContext(trust_roots=roots(party_a, party_b)))
+        assert status.bottom_line and status.intact and status.valid and status.docmdp_ok
+
+
+@pytest.mark.parametrize("tamper", [remove_field_after, replace_appearance_after, edit_page_content_after])
+def test_linearized_history_changes_still_fail_closed(party_a, party_b, tamper):
+    original = signed_linearized_layout(party_a)
+    changed = tamper(original)
+    assert_rejected(changed, party_b, CODE_INVALID_EXISTING, "not intact or the document was changed")
+
+
+def test_linearized_physical_revision_limit_includes_incremental_suffixes(party_a, party_b):
+    original = signed_linearized_layout(party_a)
+    later = with_revisions(original, 1)
+    assert_rejected(later, party_b, CODE_TOO_MANY_REVISIONS, "too many revisions", max_revisions=1)
+
+
+def test_forged_linearized_marker_does_not_hide_removed_signature(party_a, party_b):
+    original = sign_as(make_pdf(), party_a)
+    hidden = remove_field_after(original)
+    # A fake dictionary near the header must not authorize skipping signature history.
+    planted = hidden.replace(b"%PDF-1.7", b"%PDF-1.7\n% /Linearized 1 /L 999999 /E 100 /T 200", 1)
+    assert_rejected(planted, party_b, CODE_INVALID_EXISTING, "damaged")
+
+
+def test_forged_linearized_pair_cannot_hide_signature_with_a_new_catalog(party_a, party_b):
+    forged = signed_linearized_layout(party_a, hidden_complete_main=True)
+    reader = PdfFileReader(io.BytesIO(forged), strict=False)
+    assert reader.total_revisions == 2
+    assert not reader.embedded_signatures
+    assert signer_module._linearized_document_length(reader) is None
+    report = signer_module.validate_pdf_document(forged)
+    assert report["can_countersign"] is False
+    assert report["signed"] is not False
+    with pytest.raises(PdfInputError):
+        countersign(forged, party_b)

@@ -28,7 +28,7 @@
           <div class="empty-icon" aria-hidden="true"></div>
           <p class="empty-title">Drop a PDF here</p>
           <p class="muted">or <button type="button" class="link-button" id="empty-choose">choose a file</button></p>
-          <p class="muted small">The document stays in your browser until you sign it.</p>
+          <p class="muted small">The document stays in your browser until you validate or sign it locally.</p>
         </div>
       </div>
       <div class="place-banner" id="place-banner" hidden>
@@ -49,6 +49,8 @@
           </label>
           <p class="muted small" id="doc-info"></p>
           <p class="notice small" id="doc-notice" hidden></p>
+          <button type="button" class="button secondary block validate-button" id="validate" disabled>Validate signatures</button>
+          <div id="validation-results" class="validation-results" aria-live="polite" hidden></div>
         </li>
 
         <li class="step" id="step-certificate">

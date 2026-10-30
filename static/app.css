@@ -210,6 +210,12 @@ button:disabled { opacity: 0.45; cursor: default; }
 .step p.notice { margin: 8px 0 0; }
 /* Reason shown right next to a control that signed mode disabled. */
 .step p.inline-note { margin: 2px 0 6px 26px; color: #6b4300; }
+.validate-button { margin-top: 10px; }
+.validation-results { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: #f6f8fa; font-size: 12px; overflow-wrap: anywhere; }
+.step .validation-results p { margin: 4px 0 0; }
+.step .validation-results p:first-child { margin-top: 0; }
+.validation-heading { font-weight: 600; }
+.validation-signature { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
 
 .file-field {
   display: flex; align-items: center; gap: 10px; cursor: pointer; position: relative;
