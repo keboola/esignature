@@ -701,8 +701,9 @@ def test_damaged_single_revision_pdf_still_repairs_within_the_cap(party_b):
     assert_every_signature_ok(out, roots(party_b), ["Signature_1"])
 
 
-def test_initial_linearized_signature_in_main_xref_is_preserved(party_a, party_b):
-    original = signed_linearized_layout(party_a)
+@pytest.mark.parametrize("omit_main_root", [False, True])
+def test_initial_linearized_signature_in_main_xref_is_preserved(party_a, party_b, omit_main_root):
+    original = signed_linearized_layout(party_a, omit_main_root=omit_main_root)
     reader = PdfFileReader(io.BytesIO(original), strict=False)
     assert reader.total_revisions == 2
     assert reader.embedded_signatures[0].signed_revision == 0
@@ -727,8 +728,9 @@ def test_initial_linearized_signature_in_main_xref_is_preserved(party_a, party_b
 
 
 @pytest.mark.parametrize("tamper", [remove_field_after, replace_appearance_after, edit_page_content_after])
-def test_linearized_history_changes_still_fail_closed(party_a, party_b, tamper):
-    original = signed_linearized_layout(party_a)
+@pytest.mark.parametrize("omit_main_root", [False, True])
+def test_linearized_history_changes_still_fail_closed(party_a, party_b, tamper, omit_main_root):
+    original = signed_linearized_layout(party_a, omit_main_root=omit_main_root)
     changed = tamper(original)
     assert_rejected(changed, party_b, CODE_INVALID_EXISTING, "not intact or the document was changed")
 
