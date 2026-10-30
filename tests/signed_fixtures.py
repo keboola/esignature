@@ -327,7 +327,9 @@ def corrupt_signature_contents(signed: bytes) -> bytes:
     return signed[:start] + b"ffff" + signed[start + 4:]
 
 
-def signed_linearized_layout(identity: Identity, hidden_complete_main: bool = False) -> bytes:
+def signed_linearized_layout(
+    identity: Identity, hidden_complete_main: bool = False, omit_main_root: bool = False,
+) -> bytes:
     """Synthetic signed initial document with disjoint first-page/main xref sections.
 
     Like linearized PDFs, the early first-page xref points forward through /Prev to the
@@ -370,7 +372,8 @@ def signed_linearized_layout(identity: Identity, hidden_complete_main: bool = Fa
     for number in range(2, 7 if hidden_complete_main else 6):
         output.write(num(offsets[number]) + b" 00000 n \n")
     root = b"6" if hidden_complete_main else b"10"
-    output.write(b"trailer\n<< /Size 12 /Root " + root + b" 0 R >>\nstartxref\n"
+    root_entry = b"" if omit_main_root else b" /Root " + root + b" 0 R"
+    output.write(b"trailer\n<< /Size 12" + root_entry + b" >>\nstartxref\n"
                  + str(early_xref).encode() + b"\n%%EOF\n")
     pdf = output.getvalue()
     for placeholder, value in ((b"LLLLLLLLLL", len(pdf)), (b"EEEEEEEEEE", end_first),

@@ -933,13 +933,19 @@ def _linearized_document_length(reader: PdfFileReader) -> Optional[int]:
         if main_refs & first_refs:
             return None
         # Both halves must describe the SAME catalog, supplied only by the first-page half.
+        # qpdf omits /Root from the incomplete main trailer altogether.
         # Otherwise a forged pair could hide a complete older document under a new trailer root.
-        main_root = reader.trailer.flatten(0).raw_get("/Root")
+        main_trailer = reader.trailer.flatten(0)
+        main_root = main_trailer.raw_get("/Root") if "/Root" in main_trailer else None
         first_root = reader.trailer.flatten(1).raw_get("/Root")
-        if not all(isinstance(root, generic.IndirectObject) for root in (main_root, first_root)):
+        if not isinstance(first_root, generic.IndirectObject):
             return None
-        root_ref = main_root.reference
-        if root_ref != first_root.reference or root_ref not in first_refs:
+        root_ref = first_root.reference
+        if main_root is not None and (
+            not isinstance(main_root, generic.IndirectObject) or main_root.reference != root_ref
+        ):
+            return None
+        if root_ref not in first_refs:
             return None
         if reader.xrefs.get_historical_ref(root_ref, 0) is not None:
             return None
